@@ -588,7 +588,7 @@ public:
     // VAE downsamples an input with one pixel of zero padding at the right/bottom.
     ggml_tensor* try_forward_downsample2(GGMLRunnerContext* ctx, ggml_tensor* x, bool vae) {
         const int pad = vae ? 0 : 1;
-        if (!bias || ctx->weight_adapter || ctx->circular_x_enabled || ctx->circular_y_enabled ||
+        if (!bias || has_weight_adapter(ctx) || ctx->circular_x_enabled || ctx->circular_y_enabled ||
             scale != 1.f || kernel_size != std::make_pair(3, 3) || stride != std::make_pair(2, 2) ||
             padding != std::make_pair(pad, pad) || dilation != std::make_pair(1, 1) ||
             (vae && (!ctx->conv2d_direct_enabled || x->ne[0] < 2 || x->ne[1] < 2)) ||
@@ -618,7 +618,7 @@ public:
         if (bias) {
             b = params["bias"];
         }
-        if (ctx->weight_adapter) {
+        if (has_weight_adapter(ctx)) {
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type           = WeightAdapter::ForwardParams::op_type_t::OP_CONV2D;
             forward_params.conv2d.s0         = stride.second;
@@ -712,6 +712,12 @@ public:
     }
 
 private:
+    bool has_weight_adapter(const GGMLRunnerContext* ctx) const {
+        return ctx->weight_adapter &&
+               (ctx->weight_adapter->affects_tensor(prefix + "weight") ||
+                (bias && ctx->weight_adapter->affects_tensor(prefix + "bias")));
+    }
+
     ggml_tensor* try_forward_upscale(GGMLRunnerContext* ctx,
                                      ggml_tensor* x,
                                      int upscale_factor,
@@ -720,7 +726,7 @@ private:
         ggml_tensor* w = params["weight"];
         ggml_tensor* b = bias ? params["bias"] : nullptr;
         if (ctx->backend == nullptr ||
-            ctx->weight_adapter || ctx->circular_x_enabled ||
+            has_weight_adapter(ctx) || ctx->circular_x_enabled ||
             ctx->circular_y_enabled || scale != 1.f || upscale_factor <= 1 || w->ne[2] != x->ne[2] ||
             (b != nullptr && (b->type != GGML_TYPE_F32 || ggml_nelements(b) != w->ne[3])) ||
             (residual != nullptr && residual_factor_t != 1 && residual_factor_t != 2)) {

@@ -46,6 +46,8 @@ struct WeightAdapter {
             float scale     = 1.f;
         } conv2d;
     };
+    // Unknown adapters must retain their existing dispatch.
+    virtual bool affects_tensor(const std::string&) const { return true; }
     virtual ggml_tensor* patch_weight(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* weight, const std::string& weight_name) = 0;
     virtual ggml_tensor* forward_with_lora(ggml_context* ctx,
                                            ggml_backend_t backend,

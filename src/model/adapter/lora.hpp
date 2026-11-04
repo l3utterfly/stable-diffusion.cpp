@@ -1086,10 +1086,23 @@ struct LoraModel : public GGMLRunner {
 struct MultiLoraAdapter : public WeightAdapter {
 protected:
     std::vector<std::shared_ptr<LoraModel>> lora_models;
+    std::set<std::string> tensor_names;
 
 public:
     explicit MultiLoraAdapter(const std::vector<std::shared_ptr<LoraModel>>& lora_models)
         : lora_models(lora_models) {
+        for (const auto& model : lora_models) {
+            for (const auto& entry : model->lora_tensors) {
+                tensor_names.insert(entry.first);
+            }
+        }
+    }
+
+    bool affects_tensor(const std::string& name) const override {
+        // All adapter kinds and numbered slices share the full weight or bias prefix.
+        const auto prefix = "lora." + name + ".";
+        const auto it     = tensor_names.lower_bound(prefix);
+        return it != tensor_names.end() && starts_with(*it, prefix);
     }
 
     ggml_tensor* patch_weight(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* weight, const std::string& weight_name, bool with_lora_and_lokr) {
