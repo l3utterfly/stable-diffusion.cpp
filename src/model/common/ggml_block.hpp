@@ -214,9 +214,13 @@ public:
         force_prec_f32 = force_prec_f32_;
     }
 
-    bool has_quantized_weight() const {
+    ggml_type weight_type() const {
         auto it = params.find("weight");
-        return it != params.end() && it->second != nullptr && ggml_is_quantized(it->second->type);
+        return it != params.end() && it->second ? it->second->type : GGML_TYPE_F32;
+    }
+
+    bool has_quantized_weight() const {
+        return ggml_is_quantized(weight_type());
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {

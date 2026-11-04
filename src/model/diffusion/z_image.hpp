@@ -127,6 +127,20 @@ namespace ZImage {
         }
     };
 
+    inline void configure_attention_output(ggml_backend_t backend, Linear& proj) {
+#ifndef SD_USE_UPSTREAM_GGML
+        const auto type = proj.weight_type();
+        if (sd_backend_is(backend, "HTP") && type != GGML_TYPE_F8_E4M3 && type != GGML_TYPE_F8_E5M2) {
+            proj.set_scale(1.f / 16.f);
+            proj.set_force_prec_f32(true);
+            return;
+        }
+#endif
+        if (proj.has_quantized_weight()) {
+            proj.set_scale(1.f / 16.f);
+        }
+    }
+
     struct JointAttention : public GGMLBlock {
     protected:
         int64_t head_dim;
@@ -170,9 +184,7 @@ namespace ZImage {
             int64_t N       = x->ne[2];
             auto out_proj   = std::dynamic_pointer_cast<Linear>(blocks[split_qkv ? "to_out.0" : "out"]);
 
-            if (out_proj->has_quantized_weight()) {
-                out_proj->set_scale(1.f / 16.f);
-            }
+            configure_attention_output(ctx->backend, *out_proj);
 
             if (split_qkv) {
                 auto q_proj = std::dynamic_pointer_cast<Linear>(blocks["to_q"]);
@@ -470,9 +482,7 @@ namespace ZImage {
             auto to_v     = std::dynamic_pointer_cast<Linear>(blocks["attention.to_v"]);
             auto out_proj = std::dynamic_pointer_cast<Linear>(blocks["attention.to_out.0"]);
 
-            if (out_proj->has_quantized_weight()) {
-                out_proj->set_scale(1.f / 16.f);
-            }
+            configure_attention_output(ctx->backend, *out_proj);
 
             int64_t n_token = c->ne[1];
             int64_t N       = c->ne[2];
