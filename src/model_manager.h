@@ -76,6 +76,7 @@ private:
         ggml_backend_t compute_backend  = nullptr;
         ggml_backend_t transfer_backend = nullptr;
         ggml_backend_event_t event      = nullptr;
+        bool submitted                  = false;
         std::vector<std::unique_ptr<ComputeStagingBlock>> staging_blocks;
     };
 
@@ -152,6 +153,7 @@ private:
         size_t required_budget_bytes  = 0;
         size_t available_device_bytes = SIZE_MAX;
         size_t available_budget_bytes = SIZE_MAX;
+        bool requires_reclamation     = false;
         bool fits() const {
             return required_device_bytes <= available_device_bytes &&
                    required_budget_bytes <= available_budget_bytes;
@@ -291,6 +293,10 @@ public:
     WeightPrefetchResult prefetch_params(
         uintptr_t owner_id,
         const std::vector<ggml_tensor*>& tensors) override;
+    WeightPrefetchResult prepare_prefetch_params(
+        uintptr_t owner_id,
+        const std::vector<ggml_tensor*>& tensors) override;
+    void submit_prefetched_params(uintptr_t owner_id) override;
     bool activate_prefetched_params(uintptr_t owner_id,
                                     const std::vector<ggml_tensor*>& tensors) override;
     void clear_prefetched_params(uintptr_t owner_id) override;

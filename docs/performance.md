@@ -5,10 +5,15 @@ eg.:
  - flux 768x768 ~600mb
  - SD2 768x768 ~1400mb
 
-For most backends, it slows things down, but for cuda it generally speeds it up too.
-At the moment, it is only supported for some models and some backends (like cpu, cuda/rocm, metal).
+`--flash-attn on|off|auto` controls flash attention. Its effect on speed depends
+on GPU architecture, backend, driver, model, and tensor shapes. Automatic
+selection uses backend rules and, for some paths, small probes; it does not
+guarantee the fastest end-to-end generation. Compare `on` and `off` with the
+same model and generation settings over repeated runs, separating startup/probe
+time from steady-state generation time. See [backend selection](backend.md)
+for automatic selection rules and per-module overrides.
 
-Run by adding `--diffusion-fa` to the arguments and watch for:
+Watch for:
 ```
 [INFO ] stable-diffusion.cpp:312  - Using flash attention in the diffusion model
 ```
@@ -20,6 +25,29 @@ This reports the actual peak compute workspace capacity per backend, including
 CPU fallback. It excludes weights and cache buffers. Within a runner lifecycle,
 the summary is printed only on the first graph or when backend capacities or the
 segment count change.
+
+## Tune direct convolution.
+
+`--conv-direct on|off|auto` selects direct convolution or the im2col-based
+path. Performance depends on GPU architecture, backend, driver, model, and
+tensor shapes, so enabling direct convolution can either improve or reduce speed.
+
+Automatic selection uses small benchmarks on Vulkan and implicit GEMM checks
+on other backends. It does not guarantee the fastest end-to-end generation.
+Compare `on` and `off` with the same model and generation settings over
+repeated runs, keeping flash attention unchanged and separating startup/probe
+time from steady-state generation time. See [backend selection](backend.md)
+for automatic selection rules and per-module overrides.
+
+## Run conditional and unconditional CFG in one batched UNet forward.
+
+For UNet models, the conditional and unconditional guidance branches are
+concatenated into a single batch of two and run through one UNet forward per
+step instead of two separate forwards. This is enabled by default whenever the
+run qualifies for it.
+
+Use `--batched-cfg off` to force separate conditional and unconditional
+forwards.
 
 ## Use VAE tiling to reduce encode and decode memory usage.
 
@@ -130,6 +158,25 @@ Segment completion releases active workspace use while retaining the runner's
 allocator/scheduler capacity. Compatible gallocr reservations are reused across
 graphs; idle workspaces can be reclaimed under pressure and are freed at runner
 completion. Cross-graph caches survive individual graphs, but cut buffers do not.
+
+On discrete Vulkan devices, runners reuse released device buffers of the same
+size to reduce allocation overhead during segmented execution. This idle buffer
+cache is limited to 1 GiB per device and is reclaimed before allocating a new
+size or at runner completion. It is outside the managed `--max-vram` budget,
+so physical VRAM usage can be higher. Set `GGML_VK_REUSE_BUFFERS=0` to disable
+it. Unified-memory and host-memory modes do not use this cache.
+
+Discrete NVIDIA and non-GCN AMD Vulkan devices use a separate transfer queue by
+default when available and graphics queue use is disabled, so weight prefetch can overlap compute. Set
+`GGML_VK_ASYNC_USE_TRANSFER_QUEUE=0` to disable it.
+
+On discrete NVIDIA devices, allocation chunks can grow up to 4 GiB, bounded by the device's buffer and allocation
+limits, to reduce fragmentation within large graph workspaces. Other devices
+retain the 1 GiB default. `GGML_VK_SUBALLOCATION_BLOCK_SIZE` overrides this limit
+in bytes on any vendor; for example, `1073741824` selects 1 GiB and `4294967296`
+selects 4 GiB, subject to device limits. This is a soft chunk limit, not a reservation
+or a change to `--max-vram`: a single oversized tensor or exhausting the allocator's
+chunk count can require a larger allocation, which may fail.
 
 The recommended shape for "biggest model my card can host" is:
 

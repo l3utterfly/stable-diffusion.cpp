@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -32,18 +33,25 @@ struct AsyncGenerationJob {
     std::string id;
     AsyncJobKind kind     = AsyncJobKind::ImgGen;
     AsyncJobStatus status = AsyncJobStatus::Queued;
-    int64_t created_at    = unix_timestamp_now();
-    int64_t started_at    = 0;
-    int64_t completed_at  = 0;
+    std::atomic<bool> cancel_requested{false};
+    int64_t created_at   = unix_timestamp_now_ms();
+    int64_t started_at   = 0;
+    int64_t completed_at = 0;
     ImgGenJobRequest img_gen;
     VidGenJobRequest vid_gen;
     std::vector<std::string> result_images_b64;
+    json result_generation_info;
     std::string result_media_b64;
     std::string result_media_mime_type;
     int result_frame_count = 0;
     int result_fps         = 0;
     std::string error_code;
     std::string error_message;
+    mutable std::mutex preview_mutex;
+    std::string preview_b64;
+    int preview_pass          = 0;
+    int preview_step          = 0;
+    int preview_total_steps   = 0;
 };
 
 struct AsyncJobManager {
@@ -67,6 +75,7 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::vector<std::string>& output_images,
+                         json& output_info,
                          std::string& error_message);
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
@@ -74,5 +83,6 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
+                         json& output_info,
                          std::string& error_message);
 void async_job_worker(ServerRuntime& runtime);

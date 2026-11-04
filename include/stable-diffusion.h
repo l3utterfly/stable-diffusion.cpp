@@ -94,6 +94,9 @@ enum prediction_t {
     SEFI_FLOW_PRED,
     MINIT2I_FLOW_PRED,
     SENSENOVA_U1_FLOW_PRED,
+    FLUX3_FLOW_PRED,
+    H3_AV_FLOW_PRED,
+    MING_IMAGE_FLOW_PRED,
     PREDICTION_COUNT
 };
 
@@ -245,11 +248,14 @@ typedef struct {
     const char* rpc_servers;
     const char* model_args;
     bool disable_segmented_compute;  // Force monolithic graph execution even when automatic graph cutting would fit memory better
+    bool batched_cfg;                // Run the conditional and unconditional CFG branches in one batched UNet forward when supported
     float linear_scale;              // Override linear input scaling; 0 keeps the model default
     float attn_scale;                // Override flash-attention K/V scaling; 0 keeps the model default
     const char* tokenizer;           // tokenizer.json path or main=FILE,clip-l=FILE,clip-g=FILE assignments; required for PiD and Lens
     bool sage_attn;
     int conditioning_cache_size;  // Maximum cached conditioning entries per context; 0 disables caching (default: 4)
+    const char* flash_attn_mode;  // on/off/auto or module assignments (e.g. "auto,te=off"); NULL/empty honors legacy flags.
+    const char* conv_direct_mode;  // on/off/auto or diffusion/vae/controlnet assignments; NULL/empty honors legacy flags.
 } sd_ctx_params_t;
 
 typedef struct {
@@ -265,6 +271,25 @@ typedef struct {
     uint32_t channel;
     uint8_t* data;
 } sd_image_t;
+
+typedef struct {
+    sd_image_t image;
+    // Owned UTF-8 JSON using the sdcpp.generation/v1 schema.
+    char* generation_info;
+} sd_image_result_t;
+
+typedef struct {
+    sd_image_result_t* items;
+    int count;
+} sd_image_generation_result_t;
+
+typedef struct {
+    sd_image_t* frames;
+    int frame_count;
+    sd_audio_t* audio;
+    int fps;
+    char* generation_info;
+} sd_video_generation_result_t;
 
 typedef struct {
     // Semicolon-separated target=...,key=value rules. NULL preserves defaults.
@@ -453,6 +478,7 @@ typedef struct {
     bool circular_x;
     bool circular_y;
     sd_image_preprocess_params_t image_preprocess;
+    const char* ref_image_args;
 } sd_vid_gen_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;
@@ -461,6 +487,11 @@ struct ggml_tensor;
 typedef void (*sd_log_cb_t)(enum sd_log_level_t level, const char* text, void* data);
 typedef void (*sd_progress_cb_t)(int step, int steps, float time, void* data);
 typedef void (*sd_preview_cb_t)(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data);
+
+typedef struct {
+    int sample_pass;
+    int total_steps;
+} sd_preview_info_t;
 typedef bool (*sd_graph_eval_callback_t)(struct ggml_tensor* t, bool ask, void* user_data);
 
 SD_API void sd_set_log_callback(sd_log_cb_t sd_log_cb, void* data);
@@ -469,6 +500,10 @@ SD_API void sd_set_progress_callback(sd_progress_cb_t cb, void* data);
 // negative interval previews only completed logical step -interval. Zero previews the final
 // completed step of the first sampling pass (base-resolution or high-noise).
 SD_API void sd_set_preview_callback(sd_preview_cb_t cb, enum preview_t mode, int interval, bool denoised, bool noisy, void* data);
+// Query from a preview callback. Passes are numbered from 1 since the last
+// sd_set_preview_callback call; total_steps is the actual count in that pass.
+// Both fields are zero before sampling starts.
+SD_API sd_preview_info_t sd_get_preview_info();
 SD_API void sd_set_backend_eval_callback(sd_graph_eval_callback_t cb, void* data);
 SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
@@ -520,8 +555,12 @@ SD_API void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params);
 SD_API char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params);
 SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* sd_img_gen_params,
-                           sd_image_t** images_out,
-                           int* num_images_out);
+                           sd_image_generation_result_t** result_out);
+
+// Results own their pixels, audio and generation_info, independently of the context.
+// Generation calls require result_out and set it to NULL on failure.
+SD_API void free_sd_image_generation_result(sd_image_generation_result_t* result);
+SD_API void free_sd_video_generation_result(sd_video_generation_result_t* result);
 
 enum sd_cancel_mode_t {
     // Stop the current generation as soon as possible.
@@ -535,13 +574,9 @@ enum sd_cancel_mode_t {
 SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
 
 SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
-// If non-NULL, fps_out receives the effective encoding frame rate before preview callbacks.
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
-                           sd_image_t** frames_out,
-                           int* num_frames_out,
-                           sd_audio_t** audio_out,
-                           int* fps_out);
+                           sd_video_generation_result_t** result_out);
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 
@@ -556,8 +591,7 @@ SD_API void free_upscaler_ctx(upscaler_ctx_t* upscaler_ctx);
 SD_API bool upscale(upscaler_ctx_t* upscaler_ctx,
                     sd_image_t input_image,
                     uint32_t upscale_factor,
-                    sd_image_t** images_out,
-                    int* num_images_out);
+                    sd_image_generation_result_t** result_out);
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
 // Reads model metadata only; returns 0 if the file is not a recognized RGB ESRGAN model.
@@ -581,8 +615,7 @@ SD_API bool adetail_image(adetailer_ctx_t* adetailer_ctx,
                           sd_image_t input_image,
                           const sd_adetailer_params_t* adetailer_params,
                           const sd_img_gen_params_t* inpaint_params,
-                          sd_image_t** images_out,
-                          int* num_images_out);
+                          sd_image_generation_result_t** result_out);
 
 SD_API bool convert(const char* input_path,
                     const char* vae_path,
@@ -601,7 +634,9 @@ SD_API bool convert_with_components(const char* model_path,
                                     enum sd_type_t output_type,
                                     const char* tensor_type_rules,
                                     bool convert_name,
-                                    int n_threads);
+                                    int n_threads,
+                                    const sd_lora_t* loras,
+                                    int lora_count);
 
 SD_API bool preprocess_canny(sd_image_t image,
                              float high_threshold,
@@ -623,6 +658,11 @@ SD_API const char* sd_version(void);
 // assignment specs. Returns the number of bytes required, excluding the null
 // terminator. Passing nullptr or buffer_size 0 only queries the required size.
 SD_API size_t sd_list_devices(char* buffer, size_t buffer_size);
+
+// Register comma-separated RPC endpoints (host:port) before listing devices.
+// Repeated endpoints are safe; nullptr or an empty string is a no-op.
+// Returns false if RPC is unavailable or an endpoint has no usable devices.
+SD_API bool sd_add_rpc_servers(const char* servers);
 
 // for C API, caller needs to call free_sd_images to free the memory after use
 // This helps avoid CRT problems on Windows when memory is allocated in the library but freed in the caller, which may use a different CRT.
