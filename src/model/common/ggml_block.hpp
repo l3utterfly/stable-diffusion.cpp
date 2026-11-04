@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -582,7 +583,36 @@ public:
         return "Conv2d";
     }
 
+    // The direct HMX kernel reads tiled weights and supports stride 1. Keep every
+    // second sample of its pad-1 result. UNet samples even coordinates, while
+    // VAE downsamples an input with one pixel of zero padding at the right/bottom.
+    ggml_tensor* try_forward_downsample2(GGMLRunnerContext* ctx, ggml_tensor* x, bool vae) {
+        const int pad = vae ? 0 : 1;
+        if (!bias || ctx->weight_adapter || ctx->circular_x_enabled || ctx->circular_y_enabled ||
+            scale != 1.f || kernel_size != std::make_pair(3, 3) || stride != std::make_pair(2, 2) ||
+            padding != std::make_pair(pad, pad) || dilation != std::make_pair(1, 1) ||
+            (vae && (!ctx->conv2d_direct_enabled || x->ne[0] < 2 || x->ne[1] < 2)) ||
+            !sd_backend_is(ctx->backend, "HTP")) {
+            return nullptr;
+        }
+        auto c    = ctx->ggml_ctx;
+        auto full = ggml_conv_2d_direct_bias(c, params["weight"], x, params["bias"], 1, 1, 1, 1, 1, 1);
+        if (!ggml_backend_supports_op(ctx->backend, full)) {
+            return nullptr;
+        }
+        const int64_t ow = (full->ne[0] + pad) / 2;
+        const int64_t oh = (full->ne[1] + pad) / 2;
+        // A singleton first axis permits striding in x without changing the plane stride.
+        auto view = ggml_view_4d(c, full, 1, ow, oh, full->ne[2] * full->ne[3],
+                                 2 * full->nb[0], 2 * full->nb[1], full->nb[2],
+                                 vae ? full->nb[0] + full->nb[1] : 0);
+        return ggml_reshape_4d(c, ggml_cont(c, view), ow, oh, full->ne[2], full->ne[3]);
+    }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        if (auto out = try_forward_downsample2(ctx, x, false)) {
+            return out;
+        }
         ggml_tensor* w = params["weight"];
         ggml_tensor* b = nullptr;
         if (bias) {
@@ -611,6 +641,31 @@ public:
                 dilation.second, dilation.first);
             if (ggml_backend_supports_op(ctx->backend, out)) {
                 return out;
+            }
+        }
+        if (sd_backend_is(ctx->backend, "HTP")) {
+            // sd.cpp also uses bias-free direct convolution for scaled VAE layers.
+            // Restore the input scale before adding the bias.
+            if (ctx->conv2d_direct_enabled && !ctx->circular_x_enabled && !ctx->circular_y_enabled && scale != 0.f) {
+                auto c      = ctx->ggml_ctx;
+                auto scaled = scale == 1.f ? x : ggml_ext_scale(c, x, scale);
+                auto out    = ggml_conv_2d_direct(c, w, scaled, stride.second, stride.first, padding.second,
+                                                 padding.first, dilation.second, dilation.first);
+                if (ggml_backend_supports_op(ctx->backend, out)) {
+                    if (scale != 1.f) {
+                        out = ggml_ext_scale(c, out, 1.f / scale);
+                    }
+                    return b ? ggml_add_inplace(c, out, ggml_reshape_4d(c, b, 1, 1, b->ne[0], 1)) : out;
+                }
+            }
+            if ((kernel_size == std::make_pair(1, 1) || kernel_size == std::make_pair(3, 3)) && in_channels % 32 == 0) {
+                static std::once_flag warned;
+                std::call_once(warned, [&] {
+                    LOG_ERROR("%s: conv (k=%dx%d s=%dx%d p=%dx%d) falls back from the HMX direct kernel "
+                              "but its weight is HMX-repacked; the result will be wrong",
+                              prefix.c_str(), kernel_size.first, kernel_size.second,
+                              stride.first, stride.second, padding.first, padding.second);
+                });
             }
         }
         return ggml_ext_conv_2d(ctx->ggml_ctx,
