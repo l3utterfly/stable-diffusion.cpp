@@ -32,11 +32,7 @@ public:
         if (vae_downsample) {
             auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["conv"]);
 
-            if (auto out = conv->try_forward_downsample2(ctx, x, true)) {
-                return out;
-            }
-            x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
-            x = conv->forward(ctx, x);
+            x = conv->forward_vae_downsample2(ctx, x);
         } else {
             auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["op"]);
 

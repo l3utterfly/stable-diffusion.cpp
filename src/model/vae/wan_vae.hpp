@@ -283,12 +283,8 @@ namespace WAN {
                 x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (t, c, h, w)
                 if (mode == "upsample2d" || mode == "upsample3d") {
                     x = resample_1->forward_upscale(ctx, x, 2);
-                } else if (mode == "downsample2d") {
-                    x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
-                    x = resample_1->forward(ctx, x);
-                } else if (mode == "downsample3d") {
-                    x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
-                    x = resample_1->forward(ctx, x);
+                } else if (mode == "downsample2d" || mode == "downsample3d") {
+                    x = resample_1->forward_vae_downsample2(ctx, x);
                 }
                 x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
             }

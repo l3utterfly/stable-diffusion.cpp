@@ -613,6 +613,14 @@ public:
         return ggml_reshape_4d(c, ggml_cont(c, view), ow, oh, full->ne[2], full->ne[3]);
     }
 
+    ggml_tensor* forward_vae_downsample2(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        if (auto out = try_forward_downsample2(ctx, x, true)) {
+            return out;
+        }
+        x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+        return forward(ctx, x);
+    }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         if (auto out = try_forward_downsample2(ctx, x, false)) {
             return out;
