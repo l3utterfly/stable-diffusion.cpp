@@ -213,6 +213,37 @@ struct LoraModel : public GGMLRunner {
                     break;
                 }
             }
+            if (source_version == VERSION_MOSS_IMAGE &&
+                starts_with(old_name, "lora.model.diffusion_model.layers.")) {
+                // Underscore-format adapters lose MOSS's compound FFN names during conversion.
+                for (const auto& mapping : {std::make_pair(".proj.ffn.down.weight.", ".proj.ffn_down.weight"),
+                                            std::make_pair(".proj.ffn.up.gate.weight.", ".proj.ffn_up_gate.weight")}) {
+                    size_t pos = old_name.find(mapping.first);
+                    if (pos != std::string::npos) {
+                        std::string target = old_name.substr(5, pos - 5) + mapping.second;
+                        if (model_tensor_names.find(target) != model_tensor_names.end()) {
+                            new_name = "lora." + target + "." + old_name.substr(pos + strlen(mapping.first));
+                        }
+                        break;
+                    }
+                }
+                // MOSS checkpoints may fuse Q/K/V; numbered adapters concatenate in that order.
+                const char* projections[] = {".proj.q.weight.", ".proj.k.weight.", ".proj.v.weight."};
+                for (int i = 0; i < 3; ++i) {
+                    size_t pos = old_name.find(projections[i]);
+                    if (pos == std::string::npos) {
+                        continue;
+                    }
+                    std::string separate = old_name.substr(5, pos - 5) + std::string(projections[i]).substr(0, strlen(projections[i]) - 1);
+                    std::string fused = old_name.substr(5, pos - 5) + ".proj.qkv.weight";
+                    if (model_tensor_names.find(separate) == model_tensor_names.end() &&
+                        model_tensor_names.find(fused) != model_tensor_names.end()) {
+                        new_name = "lora." + fused + (i == 0 ? "." : "." + std::to_string(i) + ".") +
+                                   old_name.substr(pos + strlen(projections[i]));
+                    }
+                    break;
+                }
+            }
             new_lora_tensors[new_name] = tensor;
         }
         lora_tensors = std::move(new_lora_tensors);
