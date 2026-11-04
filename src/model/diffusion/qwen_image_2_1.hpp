@@ -187,10 +187,19 @@ namespace Qwen {
             auto q = project("to_q");
             auto k = project("to_k");
             auto v = project("to_v");
-            q      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_q"])->forward(ctx, q);
-            k      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_k"])->forward(ctx, k);
-            q      = Rope::apply_rope(ctx, q, pe);
-            k      = Rope::apply_rope(ctx, k, pe);
+            auto norm_q = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_q"]);
+            auto norm_k = std::dynamic_pointer_cast<RMSNorm>(blocks["norm_k"]);
+            auto q_rope = norm_q->try_forward_rope(ctx, q, pe);
+            auto k_rope = q_rope != nullptr ? norm_k->try_forward_rope(ctx, k, pe) : nullptr;
+            if (q_rope != nullptr && k_rope != nullptr) {
+                q = q_rope;
+                k = k_rope;
+            } else {
+                q = norm_q->forward(ctx, q);
+                k = norm_k->forward(ctx, k);
+                q = Rope::apply_rope(ctx, q, pe);
+                k = Rope::apply_rope(ctx, k, pe);
+            }
             if (cache.mode == QwenImage21PrefixCache::Mode::STORE) {
                 // Preserve query-first attention evaluation while writing each layer's
                 // prefix before its full-sequence K/V can accumulate across layers.
@@ -267,8 +276,18 @@ namespace Qwen {
         }
 
         static ggml_tensor* modulate(GGMLRunnerContext* runner_ctx, ggml_tensor* x, ggml_tensor* params, int64_t prefix_length, bool gate = false) {
-            auto ctx   = runner_ctx->ggml_ctx;
-            auto rows  = ggml_ext_chunk(ctx, params, 2, 1);
+            auto ctx  = runner_ctx->ggml_ctx;
+            auto rows = ggml_ext_chunk(ctx, params, 2, 1);
+            if (!gate) {
+                // x * (1 + row) is the fused modulate op with a zero shift; prefix tokens use rows[1].
+                auto zero_shift = ggml_ext_zeros(ctx, x->ne[0], 1, 1, 1);
+                auto fused      = prefix_length == 0
+                                      ? Flux::try_modulate_split(runner_ctx, x, rows[0], zero_shift, x->ne[1], nullptr, nullptr)
+                                      : Flux::try_modulate_split(runner_ctx, x, rows[1], zero_shift, prefix_length, rows[0], zero_shift);
+                if (fused != nullptr) {
+                    return fused;
+                }
+            }
             auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
                 row = gate ? ggml_tanh(ctx, row) : ggml_scale_bias(ctx, row, 1.f, 1.f);
                 runner_ctx->expand_graph(row);
@@ -282,12 +301,25 @@ namespace Qwen {
             return ggml_concat(ctx, prefix, target, 1);
         }
 
+        // base + branch * tanh(gate rows), using the fused op when the backend has it.
+        static ggml_tensor* gated_residual(GGMLRunnerContext* ctx, ggml_tensor* base, ggml_tensor* branch, ggml_tensor* params, int64_t prefix_length) {
+            auto rows        = ggml_ext_chunk(ctx->ggml_ctx, params, 2, 1);
+            auto gate_target = ggml_tanh(ctx->ggml_ctx, rows[0]);
+            auto fused       = prefix_length == 0
+                                   ? Flux::try_gated_residual_split(ctx, base, branch, gate_target, base->ne[1], nullptr)
+                                   : Flux::try_gated_residual_split(ctx, base, branch, ggml_tanh(ctx->ggml_ctx, rows[1]), prefix_length, gate_target);
+            if (fused != nullptr) {
+                return fused;
+            }
+            return ggml_add(ctx->ggml_ctx, base, modulate(ctx, branch, params, prefix_length, true));
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& modulation, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             const int64_t prefix_length = cache.mode == QwenImage21PrefixCache::Mode::REUSE ? 0 : layout.prefix_length;
             auto h                      = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm1"])->forward(ctx, x);
             h                           = modulate(ctx, h, modulation[0], prefix_length);
             h                           = std::dynamic_pointer_cast<QwenImage21Attention>(blocks["attn"])->forward(ctx, h, pe, layout.segments, masks, cache);
-            x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[1], prefix_length, true));
+            x                           = gated_residual(ctx, x, h, modulation[1], prefix_length);
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx, h, modulation[2], prefix_length);
             auto fused                  = blocks.find("img_mlp.gate_up");
@@ -300,7 +332,7 @@ namespace Qwen {
                 h         = ggml_swiglu_split(ctx->ggml_ctx, gate, h);
             }
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
-            return ggml_add(ctx->ggml_ctx, x, modulate(ctx, h, modulation[3], prefix_length, true));
+            return gated_residual(ctx, x, h, modulation[3], prefix_length);
         }
     };
 

@@ -81,29 +81,67 @@ namespace Flux3 {
             auto gc            = ctx->ggml_ctx;
             ggml_tensor* x_mod = nullptr;
             int64_t offset     = 0;
-            for (size_t i = 0; i < lengths.size(); ++i) {
+            // [N, C] -> [N, 1, C] for the fused per-token-range ops.
+            auto token_param = [&](ggml_tensor* t) {
+                return ggml_n_dims(t) <= 2 ? ggml_reshape_3d(gc, t, t->ne[0], 1, t->ne[1]) : t;
+            };
+            // Fused paths handle two token ranges per op; otherwise each range is processed alone.
+            for (size_t i = 0; i < lengths.size();) {
+                if (i + 1 < lengths.size()) {
+                    const int64_t length = lengths[i] + lengths[i + 1];
+                    auto fused           = Flux::try_modulate_split(ctx, ggml_norm(gc, token_slice(gc, x, offset, length), 1e-6f),
+                                                                    token_param(mods[i].scale), token_param(mods[i].shift), lengths[i],
+                                                                    token_param(mods[i + 1].scale), token_param(mods[i + 1].shift));
+                    if (fused != nullptr) {
+                        x_mod = x_mod ? ggml_concat(gc, x_mod, fused, 1) : fused;
+                        offset += length;
+                        i += 2;
+                        continue;
+                    }
+                }
                 auto part = token_slice(gc, x, offset, lengths[i]);
                 part      = Flux::modulate(ctx, ggml_norm(gc, part, 1e-6f), mods[i].shift, mods[i].scale);
                 x_mod     = x_mod ? ggml_concat(gc, x_mod, part, 1) : part;
                 offset += lengths[i];
+                ++i;
             }
             auto split = [&](ggml_tensor* v) {
                 return ggml_reshape_4d(gc, v, x->ne[0] / heads, heads, x->ne[1], x->ne[2]);
             };
-            auto norm        = std::dynamic_pointer_cast<Flux::QKNorm>(blocks["norm"]);
-            auto q           = norm->query_norm(ctx, split(linear(ctx, "q_proj", x_mod)));
-            auto k           = norm->key_norm(ctx, split(linear(ctx, "k_proj", x_mod)));
-            auto v           = split(linear(ctx, "v_proj", x_mod));
-            auto attn        = Rope::attention(ctx, q, k, v, pe, nullptr);
+            auto norm         = std::dynamic_pointer_cast<Flux::QKNorm>(blocks["norm"]);
+            auto q            = split(linear(ctx, "q_proj", x_mod));
+            auto k            = split(linear(ctx, "k_proj", x_mod));
+            auto v            = split(linear(ctx, "v_proj", x_mod));
+            ggml_tensor* attn = nullptr;
+            if (norm->try_norm_rope(ctx, &q, &k, pe)) {
+                attn = ggml_ext_attention_ext(ctx, q, k, v, heads, nullptr, true, ctx->flash_attn_enabled);
+            } else {
+                q    = norm->query_norm(ctx, q);
+                k    = norm->key_norm(ctx, k);
+                attn = Rope::attention(ctx, q, k, v, pe, nullptr);
+            }
             auto mlp         = ggml_ext_silu_act(gc, linear(ctx, "mlp_in", x_mod));
             auto update      = ggml_add(gc, linear(ctx, "attn_out", attn), linear(ctx, "mlp_out", mlp));
             ggml_tensor* out = nullptr;
             offset           = 0;
-            for (size_t i = 0; i < lengths.size(); ++i) {
+            for (size_t i = 0; i < lengths.size();) {
+                if (i + 1 < lengths.size()) {
+                    const int64_t length = lengths[i] + lengths[i + 1];
+                    auto fused           = Flux::try_gated_residual_split(ctx, token_slice(gc, x, offset, length),
+                                                                          token_slice(gc, update, offset, length),
+                                                                          token_param(mods[i].gate), lengths[i], token_param(mods[i + 1].gate));
+                    if (fused != nullptr) {
+                        out = out ? ggml_concat(gc, out, fused, 1) : fused;
+                        offset += length;
+                        i += 2;
+                        continue;
+                    }
+                }
                 auto part = ggml_mul(gc, token_slice(gc, update, offset, lengths[i]), mods[i].gate);
                 part      = ggml_add(gc, token_slice(gc, x, offset, lengths[i]), part);
                 out       = out ? ggml_concat(gc, out, part, 1) : part;
                 offset += lengths[i];
+                ++i;
             }
             return out;
         }

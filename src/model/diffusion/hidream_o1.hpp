@@ -268,7 +268,7 @@ namespace HiDreamO1 {
         std::vector<int> window_index_vec;
         std::vector<int> window_inverse_index_vec;
         std::vector<float> window_mask_vec;
-        std::vector<float> pe_vec;
+        LLM::VisionRopeData vision_rope_data;
         std::array<std::vector<int32_t>, 4> pos_embed_idx_data_;
         std::array<std::vector<float>, 4> pos_embed_weight_data_;
 
@@ -300,7 +300,7 @@ namespace HiDreamO1 {
                                                        window_index_vec,
                                                        window_inverse_index_vec,
                                                        window_mask_vec,
-                                                       pe_vec,
+                                                       vision_rope_data,
                                                        pos_embed_idx_data_,
                                                        pos_embed_weight_data_);
         }

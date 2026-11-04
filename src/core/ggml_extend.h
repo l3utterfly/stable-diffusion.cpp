@@ -249,7 +249,8 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
                                  ggml_tensor* w,
                                  ggml_tensor* b,
                                  int num_groups = 32,
-                                 float eps      = 1e-6f);
+                                 float eps      = 1e-6f,
+                                 bool inplace   = false);
 
 ggml_tensor* ggml_ext_timestep_embedding(
     ggml_context* ctx,

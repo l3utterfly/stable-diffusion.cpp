@@ -182,15 +182,32 @@ namespace Krea2 {
             : hidden_size(hidden_size),
               eps(eps) {}
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        ggml_tensor* get_scale(GGMLRunnerContext* ctx) {
             ggml_tensor* scale = params["scale"];
             if (ctx->weight_adapter) {
                 scale = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, scale, prefix + "scale.weight");
             }
-            scale = ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
-            x     = ggml_rms_norm(ctx->ggml_ctx, x, eps);
-            x     = ggml_mul_inplace(ctx->ggml_ctx, x, scale);
+            return ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            ggml_tensor* scale = get_scale(ctx);
+            x                  = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+            x                  = ggml_mul_inplace(ctx->ggml_ctx, x, scale);
             return x;
+        }
+
+        // Fused RMS norm + RoPE; nullptr when the backend has no kernel for it.
+        ggml_tensor* try_forward_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* theta) {
+            if (ctx->backend == nullptr) {
+                return nullptr;
+            }
+            ggml_tensor* scale = get_scale(ctx);
+            if (!qknorm_rope_inputs_ok(x, scale, theta)) {
+                return nullptr;
+            }
+            ggml_tensor* out = ggml_qknorm_rope(ctx->ggml_ctx, x, scale, theta, eps);
+            return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
         }
     };
 
@@ -287,12 +304,19 @@ namespace Krea2 {
             auto v = wv->forward(ctx, x);
             v      = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim_, kv_heads, L, N);
 
-            q = qnorm->forward(ctx, q);
-            k = knorm->forward(ctx, k);
+            ggml_tensor* out    = nullptr;
+            ggml_tensor* q_rope = pe != nullptr ? qnorm->try_forward_rope(ctx, q, pe) : nullptr;
+            ggml_tensor* k_rope = q_rope != nullptr ? knorm->try_forward_rope(ctx, k, pe) : nullptr;
+            if (q_rope != nullptr && k_rope != nullptr) {
+                out = ggml_ext_attention_ext(ctx, q_rope, k_rope, v, heads, mask, true, ctx->flash_attn_enabled);
+            } else {
+                q = qnorm->forward(ctx, q);
+                k = knorm->forward(ctx, k);
 
-            auto out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
-                                     : attention_no_rope(ctx, q, k, v, mask);
-            out      = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
+                out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
+                                    : attention_no_rope(ctx, q, k, v, mask);
+            }
+            out = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
             out      = wo->forward(ctx, out);
             return out;
         }
@@ -462,45 +486,61 @@ namespace Krea2 {
 
                 auto pre_x = prenorm->forward(ctx, x);
 
-                auto pre_x_main = ggml_view_3d(ctx->ggml_ctx, pre_x, D, len_main, B, nb1, nb2, 0);
-                auto pre_x_refs = ggml_view_3d(ctx->ggml_ctx, pre_x, D, len_refs, B, nb1, nb2, len_main * nb1);
+                auto attn_input = Flux::try_modulate_split(ctx, pre_x, mods_main[0], mods_main[1], len_main,
+                                                           mods_refs[0], mods_refs[1]);
+                if (attn_input == nullptr) {
+                    auto pre_x_main = ggml_view_3d(ctx->ggml_ctx, pre_x, D, len_main, B, nb1, nb2, 0);
+                    auto pre_x_refs = ggml_view_3d(ctx->ggml_ctx, pre_x, D, len_refs, B, nb1, nb2, len_main * nb1);
 
-                auto attn_in_main = Flux::modulate(ctx, pre_x_main, mods_main[1], mods_main[0], true);
-                auto attn_in_refs = Flux::modulate(ctx, pre_x_refs, mods_refs[1], mods_refs[0], true);
+                    auto attn_in_main = Flux::modulate(ctx, pre_x_main, mods_main[1], mods_main[0], true);
+                    auto attn_in_refs = Flux::modulate(ctx, pre_x_refs, mods_refs[1], mods_refs[0], true);
 
-                auto attn_input = ggml_concat(ctx->ggml_ctx, attn_in_main, attn_in_refs, 1);
+                    attn_input = ggml_concat(ctx->ggml_ctx, attn_in_main, attn_in_refs, 1);
+                }
 
                 auto attn_out = attn->forward(ctx, attn_input, pe);
 
-                auto attn_out_main = ggml_view_3d(ctx->ggml_ctx, attn_out, D, len_main, B, attn_out->nb[1], attn_out->nb[2], 0);
-                auto attn_out_refs = ggml_view_3d(ctx->ggml_ctx, attn_out, D, len_refs, B, attn_out->nb[1], attn_out->nb[2], len_main * attn_out->nb[1]);
+                if (auto fused = Flux::try_gated_residual_split(ctx, x, attn_out, mods_main[2], len_main, mods_refs[2])) {
+                    x = fused;
+                } else {
+                    auto attn_out_main = ggml_view_3d(ctx->ggml_ctx, attn_out, D, len_main, B, attn_out->nb[1], attn_out->nb[2], 0);
+                    auto attn_out_refs = ggml_view_3d(ctx->ggml_ctx, attn_out, D, len_refs, B, attn_out->nb[1], attn_out->nb[2], len_main * attn_out->nb[1]);
 
-                auto res_main = ggml_mul(ctx->ggml_ctx, attn_out_main, mods_main[2]);
-                auto res_refs = ggml_mul(ctx->ggml_ctx, attn_out_refs, mods_refs[2]);
+                    auto res_main = ggml_mul(ctx->ggml_ctx, attn_out_main, mods_main[2]);
+                    auto res_refs = ggml_mul(ctx->ggml_ctx, attn_out_refs, mods_refs[2]);
 
-                auto attn_res = ggml_concat(ctx->ggml_ctx, res_main, res_refs, 1);
+                    auto attn_res = ggml_concat(ctx->ggml_ctx, res_main, res_refs, 1);
 
-                x = ggml_add(ctx->ggml_ctx, x, attn_res);
+                    x = ggml_add(ctx->ggml_ctx, x, attn_res);
+                }
 
                 auto post_x = postnorm->forward(ctx, x);
 
-                auto post_x_main = ggml_view_3d(ctx->ggml_ctx, post_x, D, len_main, B, post_x->nb[1], post_x->nb[2], 0);
-                auto post_x_refs = ggml_view_3d(ctx->ggml_ctx, post_x, D, len_refs, B, post_x->nb[1], post_x->nb[2], len_main * post_x->nb[1]);
+                auto mlp_input = Flux::try_modulate_split(ctx, post_x, mods_main[3], mods_main[4], len_main,
+                                                          mods_refs[3], mods_refs[4]);
+                if (mlp_input == nullptr) {
+                    auto post_x_main = ggml_view_3d(ctx->ggml_ctx, post_x, D, len_main, B, post_x->nb[1], post_x->nb[2], 0);
+                    auto post_x_refs = ggml_view_3d(ctx->ggml_ctx, post_x, D, len_refs, B, post_x->nb[1], post_x->nb[2], len_main * post_x->nb[1]);
 
-                auto mlp_in_main = Flux::modulate(ctx, post_x_main, mods_main[4], mods_main[3], true);
-                auto mlp_in_refs = Flux::modulate(ctx, post_x_refs, mods_refs[4], mods_refs[3], true);
+                    auto mlp_in_main = Flux::modulate(ctx, post_x_main, mods_main[4], mods_main[3], true);
+                    auto mlp_in_refs = Flux::modulate(ctx, post_x_refs, mods_refs[4], mods_refs[3], true);
 
-                auto mlp_input = ggml_concat(ctx->ggml_ctx, mlp_in_main, mlp_in_refs, 1);
-                auto mlp_out   = mlp->forward(ctx, mlp_input);
+                    mlp_input = ggml_concat(ctx->ggml_ctx, mlp_in_main, mlp_in_refs, 1);
+                }
+                auto mlp_out = mlp->forward(ctx, mlp_input);
 
-                auto mlp_out_main = ggml_view_3d(ctx->ggml_ctx, mlp_out, D, len_main, B, mlp_out->nb[1], mlp_out->nb[2], 0);
-                auto mlp_out_refs = ggml_view_3d(ctx->ggml_ctx, mlp_out, D, len_refs, B, mlp_out->nb[1], mlp_out->nb[2], len_main * mlp_out->nb[1]);
+                if (auto fused = Flux::try_gated_residual_split(ctx, x, mlp_out, mods_main[5], len_main, mods_refs[5])) {
+                    x = fused;
+                } else {
+                    auto mlp_out_main = ggml_view_3d(ctx->ggml_ctx, mlp_out, D, len_main, B, mlp_out->nb[1], mlp_out->nb[2], 0);
+                    auto mlp_out_refs = ggml_view_3d(ctx->ggml_ctx, mlp_out, D, len_refs, B, mlp_out->nb[1], mlp_out->nb[2], len_main * mlp_out->nb[1]);
 
-                auto mlp_res_main = ggml_mul(ctx->ggml_ctx, mlp_out_main, mods_main[5]);
-                auto mlp_res_refs = ggml_mul(ctx->ggml_ctx, mlp_out_refs, mods_refs[5]);
+                    auto mlp_res_main = ggml_mul(ctx->ggml_ctx, mlp_out_main, mods_main[5]);
+                    auto mlp_res_refs = ggml_mul(ctx->ggml_ctx, mlp_out_refs, mods_refs[5]);
 
-                auto mlp_res = ggml_concat(ctx->ggml_ctx, mlp_res_main, mlp_res_refs, 1);
-                x            = ggml_add(ctx->ggml_ctx, x, mlp_res);
+                    auto mlp_res = ggml_concat(ctx->ggml_ctx, mlp_res_main, mlp_res_refs, 1);
+                    x            = ggml_add(ctx->ggml_ctx, x, mlp_res);
+                }
             } else {
                 auto mods       = mod->forward(ctx, vec);
                 auto attn_input = Flux::modulate(ctx,
@@ -509,7 +549,7 @@ namespace Krea2 {
                                                  mods[0],
                                                  true);
                 auto attn_out   = attn->forward(ctx, attn_input, pe);
-                x               = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, mods[2]));
+                x               = Flux::gated_residual(ctx, x, attn_out, mods[2]);
 
                 auto mlp_input = Flux::modulate(ctx,
                                                 postnorm->forward(ctx, x),
@@ -517,7 +557,7 @@ namespace Krea2 {
                                                 mods[3],
                                                 true);
                 auto mlp_out   = mlp->forward(ctx, mlp_input);
-                x              = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, mlp_out, mods[5]));
+                x              = Flux::gated_residual(ctx, x, mlp_out, mods[5]);
             }
             return x;
         }

@@ -240,15 +240,25 @@ namespace ZImage {
                                   qkv->nb[3],
                                   (num_heads + num_kv_heads) * qkv->nb[1]);  // [N, n_token, num_kv_heads, head_dim]
 
+            bool qk_norm_rope = false;
             if (qk_norm) {
                 auto q_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
                 auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
 
-                q = q_norm->forward(ctx, q);
-                k = k_norm->forward(ctx, k);
+                ggml_tensor* q_rope = q_norm->try_forward_rope(ctx, q, pe);
+                ggml_tensor* k_rope = q_rope ? k_norm->try_forward_rope(ctx, k, pe) : nullptr;
+                if (q_rope != nullptr && k_rope != nullptr) {
+                    x            = ggml_ext_attention_ext(ctx, q_rope, k_rope, v, num_heads, mask, true, ctx->flash_attn_enabled, 1.f / 128.f);
+                    qk_norm_rope = true;
+                } else {
+                    q = q_norm->forward(ctx, q);
+                    k = k_norm->forward(ctx, k);
+                }
             }
 
-            x = Rope::attention(ctx, q, k, v, pe, mask, 1.f / 128.f);  // [N, n_token, num_heads * head_dim]
+            if (!qk_norm_rope) {
+                x = Rope::attention(ctx, q, k, v, pe, mask, 1.f / 128.f);  // [N, n_token, num_heads * head_dim]
+            }
 
             x = out_proj->forward(ctx, x);  // [N, n_token, hidden_size]
             return x;
@@ -363,15 +373,25 @@ namespace ZImage {
                 x             = modulate(ctx, attention_norm1->forward(ctx, x), scale_msa);
                 x             = attention->forward(ctx, x, pe, mask);
                 x             = attention_norm2->forward(ctx, x);
-                x             = ggml_mul(ctx->ggml_ctx, x, ggml_tanh(ctx->ggml_ctx, gate_msa));
-                x             = ggml_add(ctx->ggml_ctx, x, residual);
+                auto gate     = ggml_tanh(ctx->ggml_ctx, gate_msa);
+                if (auto fused = Flux::try_gated_residual(ctx, residual, x, gate)) {
+                    x = fused;
+                } else {
+                    x = ggml_mul(ctx->ggml_ctx, x, gate);
+                    x = ggml_add(ctx->ggml_ctx, x, residual);
+                }
 
                 residual = x;
                 x        = modulate(ctx, ffn_norm1->forward(ctx, x), scale_mlp);
                 x        = feed_forward->forward(ctx, x);
                 x        = ffn_norm2->forward(ctx, x);
-                x        = ggml_mul(ctx->ggml_ctx, x, ggml_tanh(ctx->ggml_ctx, gate_mlp));
-                x        = ggml_add(ctx->ggml_ctx, x, residual);
+                gate     = ggml_tanh(ctx->ggml_ctx, gate_mlp);
+                if (auto fused = Flux::try_gated_residual(ctx, residual, x, gate)) {
+                    x = fused;
+                } else {
+                    x = ggml_mul(ctx->ggml_ctx, x, gate);
+                    x = ggml_add(ctx->ggml_ctx, x, residual);
+                }
             } else {
                 GGML_ASSERT(adaln_input == nullptr);
 

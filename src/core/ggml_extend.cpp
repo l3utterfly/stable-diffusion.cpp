@@ -188,6 +188,16 @@ ggml_tensor* ggml_ext_modulate(GGMLRunnerContext* ctx,
         ggml_tensor* inputs[] = {x, scale, shift};
         return ggml_ext_op_create(ctx->ggml_ctx, sd_ggml_modulate_op(), inputs, shift ? 3 : 2, nullptr);
     }
+    // Other backends (Hexagon) may implement the core MODULATE op instead.
+    if (ctx->backend != nullptr && x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+        (!shift || shift->type == GGML_TYPE_F32) && scale->ne[0] == x->ne[0] && scale->ne[1] == 1 &&
+        ggml_can_repeat(scale, x) && (!shift || (shift->ne[0] == x->ne[0] && shift->ne[1] == 1 && ggml_can_repeat(shift, x)))) {
+        ggml_tensor* zero_shift = shift ? shift : ggml_ext_zeros(ctx->ggml_ctx, x->ne[0], 1, 1, 1);
+        ggml_tensor* out        = ggml_modulate(ctx->ggml_ctx, x, scale, zero_shift, x->ne[1], nullptr, nullptr);
+        if (ggml_backend_supports_op(ctx->backend, out)) {
+            return out;
+        }
+    }
 #endif
     // Preserve separate multiply/add nodes for rounding and backend fusion matching.
     x = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, x, scale));
@@ -876,13 +886,15 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
                                  ggml_tensor* w,
                                  ggml_tensor* b,
                                  int num_groups,
-                                 float eps) {
+                                 float eps,
+                                 bool inplace) {
     if (ggml_n_dims(x) >= 3 && w != nullptr && b != nullptr) {
         w = ggml_reshape_4d(ctx, w, 1, 1, w->ne[0], 1);
         b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
     }
 
-    x = ggml_group_norm(ctx, x, num_groups, eps);
+    x = inplace ? ggml_group_norm_inplace(ctx, x, num_groups, eps)
+                : ggml_group_norm(ctx, x, num_groups, eps);
     if (w != nullptr && b != nullptr) {
         x = ggml_mul_inplace(ctx, x, w);
         x = ggml_add_inplace(ctx, x, b);

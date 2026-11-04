@@ -236,6 +236,22 @@ namespace Flux {
             x              = ggml_mul(ctx->ggml_ctx, x, w);
             return x;
         }
+
+        // Fused RMS norm + RoPE; nullptr when the backend has no kernel for it.
+        ggml_tensor* try_forward_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+            if (ctx->backend == nullptr || !qknorm_rope_inputs_ok(x, params["scale"], pe)) {
+                return nullptr;
+            }
+            ggml_tensor* out = ggml_qknorm_rope(ctx->ggml_ctx, x, params["scale"], pe, eps);
+            return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+        }
+
+        ggml_tensor* forward_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+            if (ggml_tensor* out = try_forward_rope(ctx, x, pe)) {
+                return out;
+            }
+            return Rope::apply_rope(ctx, forward(ctx, x), pe);
+        }
     };
 
     struct QKNorm : public GGMLBlock {
@@ -262,6 +278,27 @@ namespace Flux {
             x = norm->forward(ctx, x);
             return x;
         }
+
+        // Fused QK norm + RoPE for q and k together; false (q, k untouched) unless
+        // the backend runs both fused, so callers keep their own RoPE path otherwise.
+        bool try_norm_rope(GGMLRunnerContext* ctx, ggml_tensor** q, ggml_tensor** k, ggml_tensor* pe) {
+            auto q_out = std::dynamic_pointer_cast<RMSNorm>(blocks["query_norm"])->try_forward_rope(ctx, *q, pe);
+            auto k_out = q_out ? std::dynamic_pointer_cast<RMSNorm>(blocks["key_norm"])->try_forward_rope(ctx, *k, pe) : nullptr;
+            if (q_out == nullptr || k_out == nullptr) {
+                return false;
+            }
+            *q = q_out;
+            *k = k_out;
+            return true;
+        }
+
+        ggml_tensor* query_norm_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+            return std::dynamic_pointer_cast<RMSNorm>(blocks["query_norm"])->forward_rope(ctx, x, pe);
+        }
+
+        ggml_tensor* key_norm_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+            return std::dynamic_pointer_cast<RMSNorm>(blocks["key_norm"])->forward_rope(ctx, x, pe);
+        }
     };
 
     struct SelfAttention : public GGMLBlock {
@@ -280,7 +317,15 @@ namespace Flux {
             blocks["proj"]   = std::shared_ptr<GGMLBlock>(new Linear(dim, dim, proj_bias));
         }
 
-        std::vector<ggml_tensor*> pre_attention(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        // With pe and roped, q and k come back with RoPE applied when the backend
+        // fuses QK norm + RoPE (*roped = true); otherwise only normalized.
+        std::vector<ggml_tensor*> pre_attention(GGMLRunnerContext* ctx,
+                                                ggml_tensor* x,
+                                                ggml_tensor* pe = nullptr,
+                                                bool* roped     = nullptr) {
+            if (roped != nullptr) {
+                *roped = false;
+            }
             auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv"]);
             auto norm     = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
 
@@ -292,8 +337,12 @@ namespace Flux {
                                             qkv->nb[0] * head_dim, qkv->nb[1], qkv->nb[2], (qkv->nb[0]) * qkv->ne[0] / 3);
             auto v           = ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_heads, qkv->ne[1], qkv->ne[2],
                                             qkv->nb[0] * head_dim, qkv->nb[1], qkv->nb[2], (qkv->nb[0]) * 2 * qkv->ne[0] / 3);
-            q                = norm->query_norm(ctx, q);
-            k                = norm->key_norm(ctx, k);
+            if (pe != nullptr && roped != nullptr && norm->try_norm_rope(ctx, &q, &k, pe)) {
+                *roped = true;
+                return {q, k, v};
+            }
+            q = norm->query_norm(ctx, q);
+            k = norm->key_norm(ctx, k);
             return {q, k, v};
         }
 
@@ -311,9 +360,14 @@ namespace Flux {
             // x: [N, n_token, dim]
             // pe: [n_token, d_head/2, 2, 2]
             // return [N, n_token, dim]
-            auto qkv = pre_attention(ctx, x);                                   // q,k,v: [N, n_token, n_head, d_head]
-            x        = Rope::attention(ctx, qkv[0], qkv[1], qkv[2], pe, mask);  // [N, n_token, dim]
-            x        = post_attention(ctx, x);                                  // [N, n_token, dim]
+            bool roped = false;
+            auto qkv   = pre_attention(ctx, x, pe, &roped);  // q,k,v: [N, n_token, n_head, d_head]
+            if (roped) {
+                x = ggml_ext_attention_ext(ctx, qkv[0], qkv[1], qkv[2], num_heads, mask, true, ctx->flash_attn_enabled);
+            } else {
+                x = Rope::attention(ctx, qkv[0], qkv[1], qkv[2], pe, mask);  // [N, n_token, dim]
+            }
+            x = post_attention(ctx, x);  // [N, n_token, dim]
             return x;
         }
     };
@@ -428,6 +482,71 @@ namespace Flux {
         return ggml_ext_modulate(ctx, x, shift, scale);
     }
 
+    __STATIC_INLINE__ bool can_repeat_token_param(ggml_tensor* param, ggml_tensor* x) {
+        return param != nullptr && param->type == GGML_TYPE_F32 && param->ne[0] == x->ne[0] && param->ne[1] == 1 &&
+               x->ne[2] % param->ne[2] == 0 && x->ne[3] % param->ne[3] == 0;
+    }
+
+    // Fused x + x*scale + shift with separate parameters before and after token `split`,
+    // or nullptr. Skipped on CPU so CPU keeps its existing modulate graph.
+    __STATIC_INLINE__ ggml_tensor* try_modulate_split(GGMLRunnerContext* ctx,
+                                                      ggml_tensor* x,
+                                                      ggml_tensor* scale0,
+                                                      ggml_tensor* shift0,
+                                                      int64_t split,
+                                                      ggml_tensor* scale1,
+                                                      ggml_tensor* shift1) {
+        if (ctx->backend == nullptr || sd_backend_is_cpu(ctx->backend) || x->type != GGML_TYPE_F32 ||
+            !can_repeat_token_param(scale0, x) || !can_repeat_token_param(shift0, x) ||
+            (scale1 == nullptr) != (shift1 == nullptr) ||
+            (scale1 != nullptr && (!can_repeat_token_param(scale1, x) || !can_repeat_token_param(shift1, x)))) {
+            return nullptr;
+        }
+        auto out = ggml_modulate(ctx->ggml_ctx, x, scale0, shift0, split, scale1, shift1);
+        return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+    }
+
+    // Fused base + branch * gate, or nullptr. Skipped on CPU so CPU keeps its add/mul graph.
+    __STATIC_INLINE__ ggml_tensor* try_gated_residual(GGMLRunnerContext* ctx,
+                                                      ggml_tensor* base,
+                                                      ggml_tensor* branch,
+                                                      ggml_tensor* gate) {
+        if (ctx->backend == nullptr || sd_backend_is_cpu(ctx->backend) ||
+            base->type != GGML_TYPE_F32 || branch->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(base, branch) || gate->ne[0] != base->ne[0] || gate->ne[1] != 1 ||
+            !ggml_can_repeat(gate, base)) {
+            return nullptr;
+        }
+        auto out = ggml_gated_residual(ctx->ggml_ctx, base, branch, gate, base->ne[1], nullptr);
+        return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+    }
+
+    // Fused base + branch * gate with separate gates before and after token `split`, or nullptr.
+    __STATIC_INLINE__ ggml_tensor* try_gated_residual_split(GGMLRunnerContext* ctx,
+                                                            ggml_tensor* base,
+                                                            ggml_tensor* branch,
+                                                            ggml_tensor* gate0,
+                                                            int64_t split,
+                                                            ggml_tensor* gate1) {
+        if (ctx->backend == nullptr || sd_backend_is_cpu(ctx->backend) ||
+            base->type != GGML_TYPE_F32 || branch->type != GGML_TYPE_F32 || !ggml_are_same_shape(base, branch) ||
+            !can_repeat_token_param(gate0, base) || (gate1 != nullptr && !can_repeat_token_param(gate1, base))) {
+            return nullptr;
+        }
+        auto out = ggml_gated_residual(ctx->ggml_ctx, base, branch, gate0, split, gate1);
+        return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+    }
+
+    __STATIC_INLINE__ ggml_tensor* gated_residual(GGMLRunnerContext* ctx,
+                                                  ggml_tensor* base,
+                                                  ggml_tensor* branch,
+                                                  ggml_tensor* gate) {
+        if (auto out = try_gated_residual(ctx, base, branch, gate)) {
+            return out;
+        }
+        return ggml_add(ctx->ggml_ctx, base, ggml_mul(ctx->ggml_ctx, branch, gate));
+    }
+
     struct DoubleStreamBlock : public GGMLBlock {
         bool prune_mod;
         int idx = 0;
@@ -536,28 +655,55 @@ namespace Flux {
             ModulationOut txt_mod1 = txt_mods[0];
             ModulationOut txt_mod2 = txt_mods[1];
 
+            // Fused QK norm + RoPE runs per stream, so pe is split by token range.
+            ggml_tensor* txt_pe = nullptr;
+            ggml_tensor* img_pe = nullptr;
+            if (pe != nullptr && pe->ne[3] == txt->ne[1] + img->ne[1]) {
+                txt_pe = ggml_view_4d(ctx->ggml_ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], txt->ne[1],
+                                      pe->nb[1], pe->nb[2], pe->nb[3], 0);
+                img_pe = ggml_view_4d(ctx->ggml_ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], img->ne[1],
+                                      pe->nb[1], pe->nb[2], pe->nb[3], txt->ne[1] * pe->nb[3]);
+            }
+
             // prepare image for attention
+            bool img_roped     = false;
             auto img_modulated = img_norm1->forward(ctx, img);
             img_modulated      = Flux::modulate(ctx, img_modulated, img_mod1.shift, img_mod1.scale);
-            auto img_qkv       = img_attn->pre_attention(ctx, img_modulated);  // q,k,v: [N, n_img_token, n_head, d_head]
+            auto img_qkv       = img_attn->pre_attention(ctx, img_modulated, img_pe, &img_roped);  // q,k,v: [N, n_img_token, n_head, d_head]
             auto img_q         = img_qkv[0];
             auto img_k         = img_qkv[1];
             auto img_v         = img_qkv[2];
 
             // prepare txt for attention
+            bool txt_roped     = false;
             auto txt_modulated = txt_norm1->forward(ctx, txt);
             txt_modulated      = Flux::modulate(ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
-            auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated);  // q,k,v: [N, n_txt_token, n_head, d_head]
+            auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated, txt_pe, &txt_roped);  // q,k,v: [N, n_txt_token, n_head, d_head]
             auto txt_q         = txt_qkv[0];
             auto txt_k         = txt_qkv[1];
             auto txt_v         = txt_qkv[2];
 
             // run actual attention
-            auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
-            auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
-            auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
-
-            auto attn         = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_txt_token + n_img_token, n_head*d_head]
+            ggml_tensor* attn = nullptr;
+            if (img_roped || txt_roped) {
+                if (!img_roped) {
+                    img_q = Rope::apply_rope(ctx, img_q, img_pe);
+                    img_k = Rope::apply_rope(ctx, img_k, img_pe);
+                }
+                if (!txt_roped) {
+                    txt_q = Rope::apply_rope(ctx, txt_q, txt_pe);
+                    txt_k = Rope::apply_rope(ctx, txt_k, txt_pe);
+                }
+                auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 1);  // [N*n_head, n_txt_token + n_img_token, d_head]
+                auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 1);  // [N*n_head, n_txt_token + n_img_token, d_head]
+                auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
+                attn   = ggml_ext_attention_ext(ctx, q, k, v, img_attn->num_heads, mask, true, ctx->flash_attn_enabled);
+            } else {
+                auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
+                auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
+                auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
+                attn   = Rope::attention(ctx, q, k, v, pe, mask);      // [N, n_txt_token + n_img_token, n_head*d_head]
+            }
             auto txt_attn_out = ggml_view_3d(ctx->ggml_ctx,
                                              attn,
                                              attn->ne[0],
@@ -576,17 +722,17 @@ namespace Flux {
                                              txt->ne[1] * attn->nb[1]);  // [N, n_img_token, hidden_size]
 
             // calculate the img bloks
-            img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate));
+            img = Flux::gated_residual(ctx, img, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate);
 
             auto img_mlp_out = img_mlp->forward(ctx, Flux::modulate(ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
 
-            img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_mlp_out, img_mod2.gate));
+            img = Flux::gated_residual(ctx, img, img_mlp_out, img_mod2.gate);
 
             // calculate the txt bloks
-            txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn->post_attention(ctx, txt_attn_out), txt_mod1.gate));
+            txt = Flux::gated_residual(ctx, txt, txt_attn->post_attention(ctx, txt_attn_out), txt_mod1.gate);
 
             auto txt_mlp_out = txt_mlp->forward(ctx, Flux::modulate(ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
-            txt              = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_mod2.gate));
+            txt              = Flux::gated_residual(ctx, txt, txt_mlp_out, txt_mod2.gate);
 
             return {img, txt};
         }
@@ -680,9 +826,14 @@ namespace Flux {
             auto v = ggml_view_4d(ctx->ggml_ctx, qkv_mlp, head_dim, num_heads, qkv_mlp->ne[1], qkv_mlp->ne[2],
                                   qkv_mlp->nb[0] * head_dim, qkv_mlp->nb[1], qkv_mlp->nb[2], (qkv_mlp->nb[0]) * 2 * hidden_size);
 
-            q         = norm->query_norm(ctx, q);
-            k         = norm->key_norm(ctx, k);
-            auto attn = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, hidden_size]
+            ggml_tensor* attn = nullptr;
+            if (pe != nullptr && norm->try_norm_rope(ctx, &q, &k, pe)) {
+                attn = ggml_ext_attention_ext(ctx, q, k, v, num_heads, mask, true, ctx->flash_attn_enabled);  // [N, n_token, hidden_size]
+            } else {
+                q    = norm->query_norm(ctx, q);
+                k    = norm->key_norm(ctx, k);
+                attn = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, hidden_size]
+            }
 
             auto mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_hidden_dim * mlp_mult_factor, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], hidden_size * 3 * qkv_mlp->nb[0]);
             if (use_yak_mlp) {
@@ -692,10 +843,9 @@ namespace Flux {
             } else {
                 mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
             }
-            auto attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
-            auto output   = linear2->forward(ctx, attn_mlp);           // [N, n_token, hidden_size]
+            auto output = linear2->forward_segmented(ctx, attn, mlp);  // [N, n_token, hidden_size]
 
-            output = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, output, mod.gate));
+            output = Flux::gated_residual(ctx, x, output, mod.gate);
             return output;
         }
     };

@@ -1481,7 +1481,11 @@ bool StableDiffusionGGML::build_denoiser() {
         }
         case FLUX_FLOW_PRED: {
             LOG_INFO("running in Flux FLOW mode");
-            denoiser = std::make_shared<FluxFlowDenoiser>();
+            if (sd_version_is_flux3(version)) {
+                denoiser = std::make_shared<Flux3FlowDenoiser>();
+            } else {
+                denoiser = std::make_shared<FluxFlowDenoiser>();
+            }
             break;
         }
         case FLUX3_FLOW_PRED: {
