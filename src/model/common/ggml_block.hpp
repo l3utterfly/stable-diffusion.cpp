@@ -1145,7 +1145,7 @@ public:
         return x;
     }
 
-    ggml_tensor* try_forward_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* theta) {
+    ggml_tensor* try_forward_rope(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* theta, bool interleaved = true) {
         if (ctx->backend == nullptr) {
             return nullptr;
         }
@@ -1155,6 +1155,21 @@ public:
         }
         if (!qknorm_rope_inputs_ok(x, w, theta)) {
             return nullptr;
+        }
+        if (!interleaved) {
+            // The fused kernel rotates adjacent pairs. For split-half RoPE, apply
+            // the same channel permutation to Q, K and their affine weights;
+            // attention scores are invariant under this shared permutation.
+            if (x->ne[0] % 2 != 0 || x->ne[3] != 1 || x->nb[0] != ggml_element_size(x)) {
+                return nullptr;
+            }
+            auto c           = ctx->ggml_ctx;
+            const auto d     = x->ne[0];
+            const auto heads = x->ne[1];
+            const auto len   = x->ne[2];
+            x = ggml_view_4d(c, x, d / 2, 2, heads, len, d / 2 * x->nb[0], x->nb[1], x->nb[2], 0);
+            x = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, x, 1, 0, 2, 3)), d, heads, len, 1);
+            w = ggml_reshape_1d(c, ggml_cont(c, ggml_transpose(c, ggml_reshape_2d(c, w, d / 2, 2))), d);
         }
         ggml_tensor* out = ggml_qknorm_rope(ctx->ggml_ctx, x, w, theta, eps);
         return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;

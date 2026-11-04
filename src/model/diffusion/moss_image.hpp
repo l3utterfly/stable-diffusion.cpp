@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
 
 #include "core/pe_cache.h"
 
@@ -56,6 +57,21 @@ namespace MOSSImage {
         }
     };
 
+    inline ggml_tensor* attention(GGMLRunnerContext* ctx, RMSNorm& q_norm, RMSNorm& k_norm,
+                                  ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* pe) {
+        static const bool composed_rope = std::getenv("NM_MOSS_COMPOSED_ROPE") != nullptr;
+        if (!composed_rope && sd_backend_is(ctx->backend, "HTP")) {
+            auto q_rope = q_norm.try_forward_rope(ctx, q, pe, false);
+            auto k_rope = q_rope ? k_norm.try_forward_rope(ctx, k, pe, false) : nullptr;
+            if (q_rope && k_rope) {
+                return ggml_ext_attention_ext(ctx, q_rope, k_rope, v, q->ne[1], nullptr, true, ctx->flash_attn_enabled, 1.f);
+            }
+        }
+        q = q_norm.forward(ctx, q);
+        k = k_norm.forward(ctx, k);
+        return Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
+    }
+
     struct TextBlock : public GGMLBlock {
         MOSSImageConfig config;
 
@@ -82,10 +98,11 @@ namespace MOSSImage {
                 // q/k feed rms_norm and v a permuted copy, which read these strided views in place.
                 return ggml_view_4d(c, qkv, config.head_dim, config.dim / config.head_dim, x->ne[1], x->ne[2], config.head_dim * qkv->nb[0], qkv->nb[1], qkv->nb[2], i * config.dim * qkv->nb[0]);
             };
-            auto q = norm("q_norm", split(0));
-            auto k = norm("k_norm", split(1));
+            auto q = split(0);
+            auto k = split(1);
             auto v = split(2);
-            y      = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
+            y = attention(ctx, *std::static_pointer_cast<RMSNorm>(blocks["q_norm"]),
+                          *std::static_pointer_cast<RMSNorm>(blocks["k_norm"]), q, k, v, pe);
             y      = linear("proj", y);
             x      = ggml_add(c, x, y);
             y      = norm("norm2", x);
@@ -122,10 +139,11 @@ namespace MOSSImage {
                 return ggml_view_4d(c, qkv, config.head_dim, config.dim / config.head_dim, x->ne[1], x->ne[2],
                                     config.head_dim * qkv->nb[0], qkv->nb[1], qkv->nb[2], i * config.dim * qkv->nb[0]);
             };
-            auto q       = norm("q_norm", split(0));
-            auto k       = norm("k_norm", split(1));
-            auto v       = split(2);
-            y            = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
+            auto q = split(0);
+            auto k = split(1);
+            auto v = split(2);
+            y = attention(ctx, *std::static_pointer_cast<RMSNorm>(blocks["q_norm"]),
+                          *std::static_pointer_cast<RMSNorm>(blocks["k_norm"]), q, k, v, pe);
             y            = linear("proj.o", y);
             y            = ggml_mul(c, y, part(2));
             x            = ggml_add(c, x, y);
