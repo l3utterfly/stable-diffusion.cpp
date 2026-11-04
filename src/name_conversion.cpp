@@ -1041,7 +1041,13 @@ static std::string convert_moss_image_dit_name(std::string name) {
         {".proj.k.weight", ".proj.qkv.weight.1"},
         {".proj.v.weight", ".proj.qkv.weight.2"},
     };
-    replace_with_name_map(name, name_map);
+    // Resolve adapter slices later, once the base model's target names are known.
+    for (const auto& [separate, fused] : name_map) {
+        if (ends_with(name, separate)) {
+            name.replace(name.size() - separate.size(), separate.size(), fused);
+            break;
+        }
+    }
     return name;
 }
 
