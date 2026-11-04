@@ -2435,6 +2435,15 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                                         : sampling_init_latent;
     sd::Tensor<float> denoised                    = x_t;
 
+    bool allow_batched_cfg = config_->params.batched_cfg && sd_version_is_unet(version);
+    if (allow_batched_cfg) {
+        // HTP's direct convolution reads packed UNet weights and requires batch one.
+        const auto backends = backend_manager.runtime_backends(SDBackendModule::DIFFUSION);
+        allow_batched_cfg = std::none_of(backends.begin(), backends.end(), [](ggml_backend_t backend) {
+            return sd_backend_is(backend, "HTP");
+        });
+    }
+
     auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
         if (get_cancel_flag() == SD_CANCEL_ALL) {
             LOG_VERBOSE("cancelling generation");
@@ -2754,8 +2763,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             }
         }
 
-        const bool batch_cfg_ok = config_->params.batched_cfg &&
-                                  sd_version_is_unet(version) &&
+        const bool batch_cfg_ok = allow_batched_cfg &&
                                   !uncond.empty() &&
                                   img_uncond.empty() &&
                                   !skip_uncond &&

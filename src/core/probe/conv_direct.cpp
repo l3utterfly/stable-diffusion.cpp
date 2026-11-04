@@ -64,6 +64,11 @@ bool sd_probe_conv_direct(ggml_backend_t backend, bool conv3d) {
             LOG_INFO("conv%dd direct auto: %s -> off (unsupported probe graph)", dims, name);
             return false;
         }
+        if (!conv3d && sd_backend_is(backend, "HTP")) {
+            // HMX-packed 1x1/3x3 weights must stay on supported direct kernels.
+            LOG_INFO("conv2d direct auto: %s -> on (HMX)", name);
+            return true;
+        }
         if (sd_backend_is(backend, "Vulkan")) {
             std::vector<BackendProbeCase> cases;
             for (const auto& shape : {std::pair<int, int>{32, 64}, {16, 128}}) {
