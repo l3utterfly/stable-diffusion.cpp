@@ -274,8 +274,11 @@ std::string convert_diffusers_unet_to_original_sd1(std::string name) {
         {"skip_connection", "conv_shortcut"},
     };
 
-    static std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
-    if (unet_conversion_map_layer.empty()) {
+    // Streaming conversion can reach these maps concurrently on its first call.
+    // Build each cache in its static initializer so no worker can observe or
+    // mutate a partially populated table.
+    static const std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer = []() {
+        std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
         for (int i = 0; i < 4; ++i) {
             // down_blocks
             for (int j = 0; j < 2; ++j) {
@@ -321,7 +324,8 @@ std::string convert_diffusers_unet_to_original_sd1(std::string name) {
             std::string sd_mid_res_prefix = "middle_block." + std::to_string(2 * j) + ".";
             unet_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
         }
-    }
+        return unet_conversion_map_layer;
+    }();
 
     std::string result = name;
 
@@ -389,8 +393,8 @@ std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
         {"skip_connection", "conv_shortcut"},
     };
 
-    static std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
-    if (unet_conversion_map_layer.empty()) {
+    static const std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer = []() {
+        std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
         for (int i = 0; i < 3; ++i) {
             // --- down_blocks ---
             for (int j = 0; j < 2; ++j) {
@@ -439,7 +443,8 @@ std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
             std::string sd_mid_res_prefix = "middle_block." + std::to_string(2 * j) + ".";
             unet_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
         }
-    }
+        return unet_conversion_map_layer;
+    }();
 
     std::string result = name;
 
@@ -476,10 +481,9 @@ std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
 }
 
 std::string convert_diffusers_dit_to_original_sd3(std::string name) {
-    int num_layers = 38;
-    static std::unordered_map<std::string, std::string> sd3_name_map;
-
-    if (sd3_name_map.empty()) {
+    static const std::unordered_map<std::string, std::string> sd3_name_map = []() {
+        const int num_layers = 38;
+        std::unordered_map<std::string, std::string> sd3_name_map;
         // --- time_text_embed ---
         sd3_name_map["time_text_embed.timestep_embedder.linear_1.weight"] = "t_embedder.mlp.0.weight";
         sd3_name_map["time_text_embed.timestep_embedder.linear_1.bias"]   = "t_embedder.mlp.0.bias";
@@ -574,7 +578,8 @@ std::string convert_diffusers_dit_to_original_sd3(std::string name) {
         sd3_name_map["proj_out.bias"]          = "final_layer.linear.bias";
         sd3_name_map["norm_out.linear.weight"] = "final_layer.adaLN_modulation.1.weight";
         sd3_name_map["norm_out.linear.bias"]   = "final_layer.adaLN_modulation.1.bias";
-    }
+        return sd3_name_map;
+    }();
 
     replace_with_prefix_map(name, sd3_name_map);
 
@@ -582,11 +587,10 @@ std::string convert_diffusers_dit_to_original_sd3(std::string name) {
 }
 
 std::string convert_diffusers_dit_to_original_flux(std::string name) {
-    int num_layers        = 19;
-    int num_single_layers = 38;
-    static std::unordered_map<std::string, std::string> flux_name_map;
-
-    if (flux_name_map.empty()) {
+    static const std::unordered_map<std::string, std::string> flux_name_map = []() {
+        const int num_layers        = 19;
+        const int num_single_layers = 38;
+        std::unordered_map<std::string, std::string> flux_name_map;
         // --- time_embed (longcat) ---
         flux_name_map["time_embed.timestep_embedder.linear_1.weight"] = "time_in.in_layer.weight";
         flux_name_map["time_embed.timestep_embedder.linear_1.bias"]   = "time_in.in_layer.bias";
@@ -701,7 +705,8 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
         flux_name_map["proj_out.bias"]          = "final_layer.linear.bias";
         flux_name_map["norm_out.linear.weight"] = "final_layer.adaLN_modulation.1.weight";
         flux_name_map["norm_out.linear.bias"]   = "final_layer.adaLN_modulation.1.bias";
-    }
+        return flux_name_map;
+    }();
 
     replace_with_prefix_map(name, flux_name_map);
 
@@ -727,11 +732,10 @@ static std::string convert_diffusers_dit_to_original_flux3(std::string name) {
 }
 
 std::string convert_hunyuan_video_to_original_flux(std::string name) {
-    int num_layers        = 54;
-    int num_single_layers = 0;
-    static std::unordered_map<std::string, std::string> hy_name_map;
-
-    if (hy_name_map.empty()) {
+    static const std::unordered_map<std::string, std::string> hy_name_map = []() {
+        const int num_layers        = 54;
+        const int num_single_layers = 0;
+        std::unordered_map<std::string, std::string> hy_name_map;
         // --- double transformer blocks ---
         for (int i = 0; i < num_layers; ++i) {
             std::string block_prefix = "double_blocks." + std::to_string(i) + ".";
@@ -761,22 +765,22 @@ std::string convert_hunyuan_video_to_original_flux(std::string name) {
             hy_name_map[block_prefix + "img_attn_proj"] = dst_prefix + "img_attn.proj";
             hy_name_map[block_prefix + "txt_attn_proj"] = dst_prefix + "txt_attn.proj";
         }
-    }
+        hy_name_map["time_in.mlp.0"]     = "time_in.in_layer";
+        hy_name_map["time_in.mlp.2"]     = "time_in.out_layer";
+        hy_name_map["time_r_in.mlp.0"]   = "time_r_in.in_layer";
+        hy_name_map["time_r_in.mlp.2"]   = "time_r_in.out_layer";
+        hy_name_map["vector_in.mlp.0"]   = "vector_in.in_layer";
+        hy_name_map["vector_in.mlp.2"]   = "vector_in.out_layer";
+        hy_name_map["guidance_in.mlp.0"] = "guidance_in.in_layer";
+        hy_name_map["guidance_in.mlp.2"] = "guidance_in.out_layer";
 
-    hy_name_map["time_in.mlp.0"]     = "time_in.in_layer";
-    hy_name_map["time_in.mlp.2"]     = "time_in.out_layer";
-    hy_name_map["time_r_in.mlp.0"]   = "time_r_in.in_layer";
-    hy_name_map["time_r_in.mlp.2"]   = "time_r_in.out_layer";
-    hy_name_map["vector_in.mlp.0"]   = "vector_in.in_layer";
-    hy_name_map["vector_in.mlp.2"]   = "vector_in.out_layer";
-    hy_name_map["guidance_in.mlp.0"] = "guidance_in.in_layer";
-    hy_name_map["guidance_in.mlp.2"] = "guidance_in.out_layer";
+        hy_name_map["txt_in.c_embedder.linear_1"] = "txt_in.c_embedder.in_layer";
+        hy_name_map["txt_in.c_embedder.linear_2"] = "txt_in.c_embedder.out_layer";
 
-    hy_name_map["txt_in.c_embedder.linear_1"] = "txt_in.c_embedder.in_layer";
-    hy_name_map["txt_in.c_embedder.linear_2"] = "txt_in.c_embedder.out_layer";
-
-    hy_name_map["txt_in.t_embedder.mlp.0"] = "txt_in.t_embedder.in_layer";
-    hy_name_map["txt_in.t_embedder.mlp.2"] = "txt_in.t_embedder.out_layer";
+        hy_name_map["txt_in.t_embedder.mlp.0"] = "txt_in.t_embedder.in_layer";
+        hy_name_map["txt_in.t_embedder.mlp.2"] = "txt_in.t_embedder.out_layer";
+        return hy_name_map;
+    }();
 
     replace_with_prefix_map(name, hy_name_map);
 
@@ -839,11 +843,10 @@ std::string convert_diffusers_dit_to_original_llada_image(std::string name) {
 }
 
 std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
-    int num_layers         = 30;
-    int num_refiner_layers = 2;
-    static std::unordered_map<std::string, std::string> z_image_name_map;
-
-    if (z_image_name_map.empty()) {
+    static const std::unordered_map<std::string, std::string> z_image_name_map = []() {
+        const int num_layers         = 30;
+        const int num_refiner_layers = 2;
+        std::unordered_map<std::string, std::string> z_image_name_map;
         z_image_name_map["all_x_embedder.2-1."]  = "x_embedder.";
         z_image_name_map["all_final_layer.2-1."] = "final_layer.";
         z_image_name_map["all_x_embedder.16-1."] = "x_embedder.";
@@ -870,7 +873,8 @@ std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
         add_attention_map("noise_refiner.", num_refiner_layers);
         add_attention_map("context_refiner.", num_refiner_layers);
         add_attention_map("layers.", num_layers);
-    }
+        return z_image_name_map;
+    }();
 
     replace_with_prefix_map(name, z_image_name_map);
 
@@ -1134,8 +1138,8 @@ std::string convert_diffusers_vae_to_original_sd1(std::string name) {
         {"mid.attn_1.", "mid_block.attentions.0."},
     };
 
-    static std::vector<std::pair<std::string, std::string>> vae_conversion_map_layer;
-    if (vae_conversion_map_layer.empty()) {
+    static const std::vector<std::pair<std::string, std::string>> vae_conversion_map_layer = []() {
+        std::vector<std::pair<std::string, std::string>> vae_conversion_map_layer;
         for (int i = 0; i < 4; ++i) {
             // --- encoder down blocks ---
             for (int j = 0; j < 2; ++j) {
@@ -1168,7 +1172,8 @@ std::string convert_diffusers_vae_to_original_sd1(std::string name) {
             std::string sd_mid_res_prefix = "mid.block_" + std::to_string(i + 1) + ".";
             vae_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
         }
-    }
+        return vae_conversion_map_layer;
+    }();
 
     static const std::vector<std::pair<std::string, std::string>> vae_conversion_map_attn = {
         {"norm.", "group_norm."},
@@ -1559,8 +1564,8 @@ static const std::map<int, std::string>& ip_adapter_index_map(SDVersion version)
     static const std::map<int, std::string> sd15_map = {
         {1, "input_blocks.1.1.transformer_blocks.0"}, {3, "input_blocks.2.1.transformer_blocks.0"}, {5, "input_blocks.4.1.transformer_blocks.0"}, {7, "input_blocks.5.1.transformer_blocks.0"}, {9, "input_blocks.7.1.transformer_blocks.0"}, {11, "input_blocks.8.1.transformer_blocks.0"}, {13, "output_blocks.3.1.transformer_blocks.0"}, {15, "output_blocks.4.1.transformer_blocks.0"}, {17, "output_blocks.5.1.transformer_blocks.0"}, {19, "output_blocks.6.1.transformer_blocks.0"}, {21, "output_blocks.7.1.transformer_blocks.0"}, {23, "output_blocks.8.1.transformer_blocks.0"}, {25, "output_blocks.9.1.transformer_blocks.0"}, {27, "output_blocks.10.1.transformer_blocks.0"}, {29, "output_blocks.11.1.transformer_blocks.0"}, {31, "middle_block.1.transformer_blocks.0"}};
 
-    static std::map<int, std::string> sdxl_map;
-    if (sdxl_map.empty()) {
+    static const std::map<int, std::string> sdxl_map = []() {
+        std::map<int, std::string> sdxl_map;
         std::vector<std::pair<std::string, int>> order = {
             {"input_blocks.4.1", 2}, {"input_blocks.5.1", 2}, {"input_blocks.7.1", 10}, {"input_blocks.8.1", 10}, {"output_blocks.0.1", 10}, {"output_blocks.1.1", 10}, {"output_blocks.2.1", 10}, {"output_blocks.3.1", 2}, {"output_blocks.4.1", 2}, {"output_blocks.5.1", 2}, {"middle_block.1", 10}};
         int idx = 1;
@@ -1570,7 +1575,8 @@ static const std::map<int, std::string>& ip_adapter_index_map(SDVersion version)
                 idx += 2;
             }
         }
-    }
+        return sdxl_map;
+    }();
     return sd_version_is_sdxl(version) ? sdxl_map : sd15_map;
 }
 
