@@ -615,7 +615,7 @@ public:
         auto out = ggml_reshape_4d(c, ggml_cont(c, view), ow, oh, full->ne[2], full->ne[3]);
         if (scale != 1.f) {
             out = ggml_ext_scale(c, out, 1.f / scale);
-            out = ggml_add_inplace(c, out, ggml_reshape_4d(c, params["bias"], 1, 1, out_channels, 1));
+            out = add_scaled_bias(ctx, out, params["bias"]);
         }
         return out;
     }
@@ -674,7 +674,7 @@ public:
                     if (scale != 1.f) {
                         out = ggml_ext_scale(c, out, 1.f / scale);
                     }
-                    return b ? ggml_add_inplace(c, out, ggml_reshape_4d(c, b, 1, 1, b->ne[0], 1)) : out;
+                    return b ? add_scaled_bias(ctx, out, b) : out;
                 }
             }
             if ((kernel_size == std::make_pair(1, 1) || kernel_size == std::make_pair(3, 3)) && in_channels % 32 == 0) {
@@ -757,6 +757,12 @@ private:
             return nullptr;
         }
 
+        // The F16 fused kernel rounds its bias before adding. Scaled F16 VAE
+        // layers need the existing mixed F16+F32 add after restoring the scale.
+        auto deferred_bias = scale != 1.f && x->type == GGML_TYPE_F16 && residual == nullptr ? b : nullptr;
+        if (deferred_bias != nullptr) {
+            b = nullptr;
+        }
         if (scale != 1.f) {
             x = ggml_ext_scale(ctx->ggml_ctx, x, scale);
             // Bias and the compact residual join the fused sum before its scale is restored.
@@ -780,7 +786,24 @@ private:
         if (!ggml_backend_supports_op(ctx->backend, out)) {
             return nullptr;
         }
-        return scale == 1.f ? out : ggml_ext_scale(ctx->ggml_ctx, out, 1.f / scale);
+        if (scale != 1.f) {
+            out = ggml_ext_scale(ctx->ggml_ctx, out, 1.f / scale);
+        }
+        return deferred_bias ? add_scaled_bias(ctx, out, deferred_bias) : out;
+    }
+
+    ggml_tensor* add_scaled_bias(GGMLRunnerContext* ctx, ggml_tensor* out, ggml_tensor* b) {
+        auto c = ctx->ggml_ctx;
+        const bool widen = scale != 1.f && sd_backend_is(ctx->backend, "HTP") &&
+                           out->type == GGML_TYPE_F16 && b->type == GGML_TYPE_F32;
+        // HTP binary ops require matching types. Preserve CPU mixed-add semantics:
+        // promote the exact half value, add the original float bias, then round
+        // once to half. Casting the bias first changes half-way rounding cases.
+        if (widen) {
+            out = ggml_cast(c, out, GGML_TYPE_F32);
+        }
+        out = ggml_add_inplace(c, out, ggml_reshape_4d(c, b, 1, 1, b->ne[0], 1));
+        return widen ? ggml_cast(c, out, GGML_TYPE_F16) : out;
     }
 };
 
