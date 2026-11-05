@@ -680,6 +680,10 @@ public:
                 });
             }
         }
+        // Supported HTP direct convolutions returned above. A rejected shape
+        // (e.g. the VAE's 16-channel input) must use im2col: CPU direct fallback
+        // would leave the following in-place bias add aliasing a CPU buffer.
+        const bool fallback_direct = ctx->conv2d_direct_enabled && !sd_backend_is(ctx->backend, "HTP");
         return ggml_ext_conv_2d(ctx->ggml_ctx,
                                 x,
                                 w,
@@ -690,7 +694,7 @@ public:
                                 padding.first,
                                 dilation.second,
                                 dilation.first,
-                                ctx->conv2d_direct_enabled,
+                                fallback_direct,
                                 ctx->circular_x_enabled,
                                 ctx->circular_y_enabled,
                                 scale);
