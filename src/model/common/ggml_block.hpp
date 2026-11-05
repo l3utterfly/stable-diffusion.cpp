@@ -593,14 +593,16 @@ public:
     ggml_tensor* try_forward_downsample2(GGMLRunnerContext* ctx, ggml_tensor* x, bool vae) {
         const int pad = vae ? 0 : 1;
         if (!bias || has_weight_adapter(ctx) || ctx->circular_x_enabled || ctx->circular_y_enabled ||
-            scale != 1.f || kernel_size != std::make_pair(3, 3) || stride != std::make_pair(2, 2) ||
+            (!std::isfinite(scale) || scale == 0.f) || kernel_size != std::make_pair(3, 3) || stride != std::make_pair(2, 2) ||
             padding != std::make_pair(pad, pad) || dilation != std::make_pair(1, 1) ||
             (vae && (!ctx->conv2d_direct_enabled || x->ne[0] < 2 || x->ne[1] < 2)) ||
             !sd_backend_is(ctx->backend, "HTP")) {
             return nullptr;
         }
-        auto c    = ctx->ggml_ctx;
-        auto full = ggml_conv_2d_direct_bias(c, params["weight"], x, params["bias"], 1, 1, 1, 1, 1, 1);
+        auto c = ctx->ggml_ctx;
+        auto full = scale == 1.f
+                        ? ggml_conv_2d_direct_bias(c, params["weight"], x, params["bias"], 1, 1, 1, 1, 1, 1)
+                        : ggml_conv_2d_direct(c, params["weight"], ggml_ext_scale(c, x, scale), 1, 1, 1, 1, 1, 1);
         if (!ggml_backend_supports_op(ctx->backend, full)) {
             return nullptr;
         }
@@ -610,7 +612,12 @@ public:
         auto view = ggml_view_4d(c, full, 1, ow, oh, full->ne[2] * full->ne[3],
                                  2 * full->nb[0], 2 * full->nb[1], full->nb[2],
                                  vae ? full->nb[0] + full->nb[1] : 0);
-        return ggml_reshape_4d(c, ggml_cont(c, view), ow, oh, full->ne[2], full->ne[3]);
+        auto out = ggml_reshape_4d(c, ggml_cont(c, view), ow, oh, full->ne[2], full->ne[3]);
+        if (scale != 1.f) {
+            out = ggml_ext_scale(c, out, 1.f / scale);
+            out = ggml_add_inplace(c, out, ggml_reshape_4d(c, params["bias"], 1, 1, out_channels, 1));
+        }
+        return out;
     }
 
     ggml_tensor* forward_vae_downsample2(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -743,25 +750,37 @@ private:
         ggml_tensor* b = bias ? params["bias"] : nullptr;
         if (ctx->backend == nullptr ||
             has_weight_adapter(ctx) || ctx->circular_x_enabled ||
-            ctx->circular_y_enabled || scale != 1.f || upscale_factor <= 1 || w->ne[2] != x->ne[2] ||
+            ctx->circular_y_enabled || (scale != 1.f && (!std::isfinite(scale) || scale == 0.f || !sd_backend_is(ctx->backend, "HTP"))) ||
+            upscale_factor <= 1 || w->ne[2] != x->ne[2] ||
             (b != nullptr && (b->type != GGML_TYPE_F32 || ggml_nelements(b) != w->ne[3])) ||
             (residual != nullptr && residual_factor_t != 1 && residual_factor_t != 2)) {
             return nullptr;
         }
 
+        if (scale != 1.f) {
+            x = ggml_ext_scale(ctx->ggml_ctx, x, scale);
+            // Bias and the compact residual join the fused sum before its scale is restored.
+            if (b != nullptr) {
+                b = ggml_ext_scale(ctx->ggml_ctx, b, scale);
+            }
+            if (residual != nullptr) {
+                residual = ggml_ext_scale(ctx->ggml_ctx, residual, scale);
+            }
+        }
         ggml_tensor* out = residual == nullptr
                                ? ggml_conv_2d_direct_upscale(
-                                     ctx->ggml_ctx, params["weight"], x,
-                                     bias ? params["bias"] : nullptr, upscale_factor,
+                                     ctx->ggml_ctx, w, x, b, upscale_factor,
                                      stride.second, stride.first, padding.second, padding.first,
                                      dilation.second, dilation.first)
                                : ggml_conv_2d_direct_upscale_add(
-                                     ctx->ggml_ctx, params["weight"], x,
-                                     bias ? params["bias"] : nullptr,
+                                     ctx->ggml_ctx, w, x, b,
                                      residual, residual_factor_t, upscale_factor,
                                      stride.second, stride.first, padding.second, padding.first,
                                      dilation.second, dilation.first);
-        return ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
+        if (!ggml_backend_supports_op(ctx->backend, out)) {
+            return nullptr;
+        }
+        return scale == 1.f ? out : ggml_ext_scale(ctx->ggml_ctx, out, 1.f / scale);
     }
 };
 
