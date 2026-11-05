@@ -15,6 +15,30 @@ namespace WAN {
 
     constexpr int CACHE_T = 2;
 
+    inline ggml_tensor* residual_add(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* residual) {
+        auto out = ggml_add(ctx->ggml_ctx, x, residual);
+        if (!sd_backend_is(ctx->backend, "HTP") || ggml_backend_supports_op(ctx->backend, out) ||
+            x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32) {
+            return out;
+        }
+        // A singleton temporal/channel permutation can be contiguous while its
+        // strides remain permuted. HTP binary ops reject that layout; materialize
+        // only unsupported inputs, using the backend's existing copy operation.
+        auto contiguous = [ctx](ggml_tensor* value) {
+            return ggml_is_permuted(value) || !ggml_is_contiguous(value)
+                       ? ggml_cont(ctx->ggml_ctx, value) : value;
+        };
+        auto a = contiguous(x);
+        auto b = contiguous(residual);
+        auto supported = ggml_add(ctx->ggml_ctx, a, b);
+        if ((a != x && !ggml_backend_supports_op(ctx->backend, a)) ||
+            (b != residual && !ggml_backend_supports_op(ctx->backend, b)) ||
+            !ggml_backend_supports_op(ctx->backend, supported)) {
+            return out;
+        }
+        return supported;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -384,7 +408,18 @@ namespace WAN {
             x = ggml_reshape_3d(ctx->ggml_ctx, x, (W / factor_s) * (H / factor_s) * (T / factor_t), group_size, out_channels);        // [out_channels, group_size, T/factor_t*H/factor_s*W/factor_s]
 
             x = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [out_channels, T/factor_t*H/factor_s*W/factor_s, group_size]
-            x = ggml_mean(ctx->ggml_ctx, x);                                                     // [out_channels, T/factor_t*H/factor_s*W/factor_s, 1]
+            auto mean = ggml_mean(ctx->ggml_ctx, x);
+            if (sd_backend_is(ctx->backend, "HTP") && !ggml_backend_supports_op(ctx->backend, mean)) {
+                // HTP exposes SUM_ROWS and SCALE, but not MEAN. Keep the same
+                // reduction axis and normalization without transferring the
+                // spatial shortcut to CPU.
+                auto sum = ggml_sum_rows(ctx->ggml_ctx, x);
+                auto scaled = ggml_scale(ctx->ggml_ctx, sum, 1.f / static_cast<float>(x->ne[0]));
+                if (ggml_backend_supports_op(ctx->backend, sum) && ggml_backend_supports_op(ctx->backend, scaled)) {
+                    mean = scaled;
+                }
+            }
+            x = mean;  // [out_channels, T/factor_t*H/factor_s*W/factor_s, 1]
             x = ggml_reshape_4d(ctx->ggml_ctx, x, W / factor_s, H / factor_s, T / factor_t, out_channels);
             return x;
         }
@@ -528,7 +563,7 @@ namespace WAN {
                 }
             }
 
-            x = ggml_add(ctx->ggml_ctx, x, h);
+            x = residual_add(ctx, x, h);
             return x;
         }
     };
@@ -588,7 +623,7 @@ namespace WAN {
 
             auto shortcut = avg_shortcut->forward(ctx, x_copy, b);
 
-            x = ggml_add(ctx->ggml_ctx, x, shortcut);
+            x = residual_add(ctx, x, shortcut);
 
             return x;
         }
@@ -657,7 +692,7 @@ namespace WAN {
                     auto avg_shortcut = std::dynamic_pointer_cast<DupUp3D>(blocks["avg_shortcut"]);
                     auto shortcut     = avg_shortcut->forward(ctx, x_copy, chunk_idx == 0, b);
 
-                    x = ggml_add(ctx->ggml_ctx, x, shortcut);
+                    x = residual_add(ctx, x, shortcut);
                 }
             }
 
@@ -721,7 +756,7 @@ namespace WAN {
 
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
 
-            x = ggml_add(ctx->ggml_ctx, x, identity);
+            x = residual_add(ctx, x, identity);
             return x;
         }
     };
