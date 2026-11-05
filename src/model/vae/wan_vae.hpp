@@ -128,6 +128,10 @@ namespace WAN {
             }
 
             x = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            // A rejected HTP causal kernel (e.g. RGB input) must use im2col.
+            // The legacy VAE direct flag now also enables generic Conv3d, whose
+            // CPU output cannot safely back an in-place HTP bias result.
+            const bool htp_fallback = sd_backend_is(ctx->backend, "HTP");
             if (w->ne[2] == 1 && x->ne[2] == 1 && x->ne[3] == in_channels) {
                 // One frame through a one-frame-deep kernel is a 2D conv; backends without
                 // im2col_3d (Metal) otherwise fall back to a much slower direct conv_3d.
@@ -139,14 +143,14 @@ namespace WAN {
                 x2              = ggml_ext_conv_2d(ctx->ggml_ctx, x2, w2, b,
                                                    std::get<2>(stride), std::get<1>(stride), 0, 0,
                                                    std::get<2>(dilation), std::get<1>(dilation),
-                                                   ctx->conv2d_direct_enabled, false, false, scale);
+                                                   ctx->conv2d_direct_enabled && !htp_fallback, false, false, scale);
                 return ggml_reshape_4d(ctx->ggml_ctx, x2, x2->ne[0], x2->ne[1], 1, out_channels);
             }
             return ggml_ext_conv_3d(ctx->ggml_ctx, ctx->backend, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
                                     std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
-                                    false, ctx->conv3d_direct_enabled, scale);
+                                    false, ctx->conv3d_direct_enabled && !htp_fallback, scale);
         }
     };
 
