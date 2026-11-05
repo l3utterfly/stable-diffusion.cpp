@@ -324,7 +324,23 @@ public:
             forward_params.linear.scale          = scale;
             out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
         } else {
-            out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
+            if (linear_bias != nullptr && sd_backend_is(ctx->backend, "HTP")) {
+                out = ggml_ext_linear(ctx->ggml_ctx, x, w, nullptr, force_prec_f32, scale);
+                // Unsupported weight types (e.g. NVFP4) execute their matmul on
+                // CPU. An inplace bias would keep that CPU allocation even if
+                // the scheduler copies its input and places the ADD on HTP.
+                // Follow aliases to the storage-producing operation; a supported
+                // producer retains the existing inplace graph.
+                const ggml_tensor* producer = out;
+                while (producer->view_src != nullptr) {
+                    producer = producer->view_src;
+                }
+                out = ggml_backend_supports_op(ctx->backend, producer)
+                          ? ggml_add_inplace(ctx->ggml_ctx, out, linear_bias)
+                          : ggml_add(ctx->ggml_ctx, out, linear_bias);
+            } else {
+                out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
+            }
         }
         return out;
     }
