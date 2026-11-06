@@ -243,6 +243,9 @@ public:
 
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                    const std::string& prefix) = 0;
+
+    // Wan 2.2 Fun 5B Control: takes 100 conditioning channels (c_concat) and a reference latent.
+    virtual bool wan_fun_control() const { return false; }
 };
 
 #endif  // __SD_MODEL_DIFFUSION_MODEL_HPP__

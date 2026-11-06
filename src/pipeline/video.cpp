@@ -1175,6 +1175,64 @@ namespace sd::pipeline {
             LOG_INFO("s2v conditioning prepared, taking %" PRId64 " ms", t2 - t1);
         }
 
+
+        // Wan 2.2 Fun 5B Control (VideoX-Fun pipeline_wan2_2_fun_control): 100 channels concatenated
+        // to the latent, [control 48, mask 4, masked video 48], and a reference latent for ref_conv.
+        // The start image (if any) already went through the TI2V branch above (frame 0 held at t = 0);
+        // here it also fills the masked video and the mask, as VideoX-Fun's inpaint inputs do.
+        if (sd->diffusion_model->wan_fun_control()) {
+            LOG_INFO("Wan2.2 Fun Control: %d control frames, %d reference image(s)",
+                     sd_vid_gen_params->control_frames_size, sd_vid_gen_params->ref_images_count);
+            int64_t t1 = ggml_time_ms();
+            sd::Tensor<float> control_video = sd::full<float>({request->width, request->height, request->frames, 3, 1}, 0.5f);
+            int64_t control_frame_count     = std::min<int64_t>(request->frames, sd_vid_gen_params->control_frames_size);
+            for (int64_t i = 0; i < control_frame_count; ++i) {
+                auto control_frame = sd_image_to_tensor(sd_vid_gen_params->control_frames[i], request->width, request->height);
+                sd::ops::slice_assign(&control_video, 2, i, i + 1, control_frame.unsqueeze(2));
+            }
+            auto control_latent = control_frame_count > 0 ? sd->encode_first_stage(control_video)
+                                                          : sd::Tensor<float>();
+            if (control_frame_count > 0 && control_latent.empty()) {
+                LOG_ERROR("failed to encode the Fun control video");
+                return std::nullopt;
+            }
+            auto shape_ref = sd->generate_init_latent(request->width, request->height, request->frames, true);  // [w, h, t, c, b]
+            if (control_latent.empty()) {
+                control_latent = sd::zeros<float>(shape_ref.shape());
+            }
+            sd::Tensor<float> mask_latent   = sd::zeros<float>({shape_ref.shape()[0], shape_ref.shape()[1], shape_ref.shape()[2], 4, 1});
+            sd::Tensor<float> masked_latent = sd::zeros<float>(shape_ref.shape());
+            if (!start_image.empty()) {
+                sd::Tensor<float> masked_video = sd::full<float>({request->width, request->height, request->frames, 3, 1}, 0.5f);
+                sd::ops::slice_assign(&masked_video, 2, 0, 1,
+                                      start_image.reshape({start_image.shape()[0], start_image.shape()[1], 1, start_image.shape()[2], 1}));
+                masked_latent = sd->encode_first_stage(masked_video);
+                if (masked_latent.empty()) {
+                    LOG_ERROR("failed to encode the Fun masked video");
+                    return std::nullopt;
+                }
+                sd::ops::fill_slice(&mask_latent, 2, 0, 1, 1.0f);  // latent frame 0 is kept
+            }
+            latents.concat_latent = sd::ops::concat(sd::ops::concat(control_latent, mask_latent, 3), masked_latent, 3);  // [w, h, t, 100, b]
+
+            // The reference: VideoX-Fun passes zeros when there is none, and ref_conv always runs.
+            sd::Tensor<float> ref_latent;
+            if (sd_vid_gen_params->ref_images_count > 0) {
+                auto ref_img = sd_image_to_tensor(sd_vid_gen_params->ref_images[0], request->width, request->height).unsqueeze(2);  // [w, h, 1, 3, 1]
+                ref_latent   = sd->encode_first_stage(ref_img);  // [w, h, 1, c, 1]
+                if (ref_latent.empty()) {
+                    LOG_ERROR("failed to encode the Fun reference image");
+                    return std::nullopt;
+                }
+            } else {
+                ref_latent = sd::zeros<float>({shape_ref.shape()[0], shape_ref.shape()[1], 1, shape_ref.shape()[3], 1});
+            }
+            // [w, h, c, 1]: the 4-D image layout ref_conv takes. Carried in vace_context, which this
+            // model (no VACE blocks) reads as its reference.
+            latents.vace_context = ref_latent.reshape({ref_latent.shape()[0], ref_latent.shape()[1], ref_latent.shape()[3], 1});
+            LOG_INFO("Wan2.2 Fun Control: conditioning encoded, taking %" PRId64 " ms", ggml_time_ms() - t1);
+        }
+
         if (latents.init_latent.empty()) {
             latents.init_latent = sd->generate_init_latent(request->width, request->height, request->frames, true);
         }

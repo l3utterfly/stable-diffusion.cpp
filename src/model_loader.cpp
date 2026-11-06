@@ -672,7 +672,9 @@ SDVersion ModelLoader::get_sd_version() const {
         if (patch_embedding_channels == 184320 && !has_img_emb) {
             return VERSION_WAN2_2_I2V;
         }
-        if (patch_embedding_channels == 147456 && !has_img_emb) {
+        // Wan 2.2 TI2V 5B: 48 latent channels x dim 3072. Wan 2.2 Fun 5B Control concatenates
+        // 100 more (control 48 + mask 4 + masked video 48): 148 x 3072.
+        if ((patch_embedding_channels == 147456 || patch_embedding_channels == 454656) && !has_img_emb) {
             return VERSION_WAN2_2_TI2V;
         }
         return VERSION_WAN2;

@@ -45,6 +45,9 @@ namespace WAN {
         bool cross_attn_norm                    = true;
         float eps                               = 1e-6f;
         int64_t flf_pos_embed_token_number      = 0;
+        int64_t patch_embedding_ne3             = 0;
+        bool add_ref_conv                       = false;
+        int64_t in_dim_ref_conv                  = 48;
         int theta                               = 10000;
         // wan2.1 1.3B: 1536/12, wan2.1/2.2 14B: 5120/40, wan2.2 5B: 3074/24
         std::vector<int> axes_dim = {44, 42, 42};
@@ -53,8 +56,16 @@ namespace WAN {
         static WanConfig detect_from_weights(const String2TensorStorage& tensor_storage_map, const std::string& prefix) {
             WanConfig config;
             config.num_layers = 0;
-            for (const auto& [name, _] : tensor_storage_map) {
+            for (const auto& [name, storage] : tensor_storage_map) {
                 if (!starts_with(name, prefix)) {
+                    continue;
+                }
+                if (ends_with(name, "patch_embedding.weight")) {
+                    config.patch_embedding_ne3 = storage.ne[3];
+                }
+                if (ends_with(name, "ref_conv.weight")) {
+                    config.add_ref_conv    = true;
+                    config.in_dim_ref_conv = storage.ne[2];
                     continue;
                 }
                 size_t pos = name.find("vace_blocks.");
@@ -696,6 +707,13 @@ namespace WAN {
                 blocks["img_emb"] = std::shared_ptr<GGMLBlock>(new MLPProj(1280, config.dim, config.flf_pos_embed_token_number));
             }
 
+            if (config.add_ref_conv) {
+                blocks["ref_conv"] = std::shared_ptr<GGMLBlock>(new Conv2d(config.in_dim_ref_conv,
+                                                                           config.dim,
+                                                                           {std::get<1>(config.patch_size), std::get<2>(config.patch_size)},
+                                                                           {std::get<1>(config.patch_size), std::get<2>(config.patch_size)}));
+            }
+
             // vace
             if (config.vace_layers > 0) {
                 for (int i = 0; i < config.vace_layers; i++) {
@@ -860,7 +878,7 @@ namespace WAN {
             ggml_tensor* e0      = nullptr;
             ggml_tensor* e_rest  = nullptr;
             ggml_tensor* e0_rest = nullptr;
-            if (config.in_dim == 48 && N == 1 && timestep->ne[0] == 2 && frame_tokens > 0 &&
+            if ((config.in_dim == 48 || config.in_dim == 148) && N == 1 && timestep->ne[0] == 2 && frame_tokens > 0 &&
                 x->ne[1] > frame_tokens) {
                 std::tie(e, e0)           = embed_time(ggml_view_1d(ctx->ggml_ctx, timestep, 1, 0));
                 std::tie(e_rest, e0_rest) = embed_time(ggml_view_1d(ctx->ggml_ctx, timestep, 1, timestep->nb[0]));
@@ -894,6 +912,22 @@ namespace WAN {
                 c = ggml_reshape_3d(ctx->ggml_ctx, c, c->ne[0] * c->ne[1] * c->ne[2], c->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
             }
+            // Wan 2.2 Fun Control: the reference latent ([W, H, C_ref, N], carried in vace_context
+            // since this model has no VACE blocks) through ref_conv, as one extra frame of tokens.
+            // VideoX-Fun PREPENDS it at temporal position 0; here it is APPENDED and given
+            // position 0's RoPE rows (WanRunner::build_graph), so attention is the same and the
+            // frame-0 / rest split of the modulation (TI2V image to video) is untouched: the
+            // reference sits with "the rest", at t, as VideoX-Fun pads its timestep.
+            int64_t ref_tokens = 0;
+            if (config.add_ref_conv && config.vace_layers == 0 && vace_context != nullptr) {
+                auto ref_conv = std::dynamic_pointer_cast<Conv2d>(blocks["ref_conv"]);
+                auto r        = ref_conv->forward(ctx, vace_context);                                // [N*dim, h_len, w_len]
+                r             = ggml_reshape_3d(ctx->ggml_ctx, r, r->ne[0] * r->ne[1], r->ne[2], N);  // [N, dim, h_len*w_len]
+                r             = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, r, 1, 0, 2, 3));  // [N, h_len*w_len, dim]
+                ref_tokens    = r->ne[1];
+                x             = ggml_concat(ctx->ggml_ctx, x, r, 1);  // [N, t_len*h_len*w_len + ref, dim]
+            }
+
             sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
             // sd::ggml_graph_cut::mark_graph_cut(e, "wan.prelude", "e");
             // sd::ggml_graph_cut::mark_graph_cut(e0, "wan.prelude", "e0");
@@ -940,6 +974,10 @@ namespace WAN {
             }
 
             x = head->forward(ctx, x, e, e_rest, frame_tokens);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
+
+            if (ref_tokens > 0) {
+                x = ggml_ext_slice(ctx->ggml_ctx, x, 1, 0, x->ne[1] - ref_tokens);  // drop the reference
+            }
 
             return x;
         }
@@ -1026,6 +1064,16 @@ namespace WAN {
                     config.ffn_dim   = 14336;
                     config.freq_dim  = 256;
                     config.in_dim    = 48;
+                    // Wan 2.2 Fun 5B Control: in_dim 148 (48 + control 48 + mask 4 + masked 48)
+                    // and a reference conv. It keeps the TI2V desc: every TI2V path (start image,
+                    // per-frame timesteps) applies to it unchanged.
+                    if (config.patch_embedding_ne3 > 0 && config.patch_embedding_ne3 % config.dim == 0) {
+                        config.in_dim = config.patch_embedding_ne3 / config.dim;
+                    }
+                    if (config.in_dim != 48 || config.add_ref_conv) {
+                        LOG_INFO("Wan2.2 Fun Control: in_dim %" PRId64 ", ref_conv %d (%" PRId64 " channels)",
+                                 config.in_dim, config.add_ref_conv ? 1 : 0, config.in_dim_ref_conv);
+                    }
                     config.num_heads = 24;
                     config.out_dim   = 48;
                     config.text_len  = 512;
@@ -1093,6 +1141,10 @@ namespace WAN {
             return desc;
         }
 
+        bool wan_fun_control() const override {
+            return config.in_dim == 148;
+        }
+
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
             wan.get_param_tensors(tensors, prefix);
         }
@@ -1119,11 +1171,13 @@ namespace WAN {
             ggml_tensor* audio_embed     = make_optional_input(audio_embed_tensor);
             ggml_tensor* ref_latent      = make_optional_input(ref_latent_tensor);
 
+            const bool fun_ref = config.add_ref_conv && config.vace_layers == 0 && vace_context != nullptr;
             sd::PECacheKey pe_key("wan.pe");
+            pe_key.add(fun_ref);
             pe_key.add_shape(x).add_shape(ref_latent).add(config.theta).add(config.axes_dim).add(config.axes_dim_sum);
             pe_key.add(std::get<0>(config.patch_size)).add(std::get<1>(config.patch_size)).add(std::get<2>(config.patch_size));
             auto pe = make_input(pe_cache_.get_or_create(pe_key, [&]() {
-                auto pe_vec = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
+                auto pe_vec = Rope::gen_wan_pe(static_cast<int>(x->ne[2]) + (fun_ref ? 1 : 0),
                                                static_cast<int>(x->ne[1]),
                                                static_cast<int>(x->ne[0]),
                                                std::get<0>(config.patch_size),
@@ -1132,6 +1186,11 @@ namespace WAN {
                                                1,
                                                config.theta,
                                                config.axes_dim);
+                if (fun_ref) {
+                    // The appended reference tokens use temporal position zero.
+                    const size_t frame_floats = pe_vec.size() / static_cast<size_t>(x->ne[2] + 1);
+                    std::rotate(pe_vec.begin(), pe_vec.begin() + frame_floats, pe_vec.end());
+                }
                 if (ref_latent != nullptr) {
                     int t_start = std::max(30, static_cast<int>(x->ne[2]) + 9);
                     auto ref_pe = Rope::gen_wan_pe(static_cast<int>(ref_latent->ne[2]),
