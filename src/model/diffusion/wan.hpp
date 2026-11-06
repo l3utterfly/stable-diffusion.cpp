@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <map>
 #include <memory>
+#include <tuple>
 #include <utility>
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_tensor_utils.h"
@@ -153,10 +154,35 @@ namespace WAN {
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
 
-            x = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
+            // Fused rope on backends that have it (both or neither); the composed
+            // Rope::attention everywhere else. Its REPEAT/MUL/ADD/CONT were 66 of 74 s of
+            // HTP time in a 4-step 512x320x17 run.
+            ggml_tensor* q_rope = mask == nullptr ? try_rope_only(ctx, q, pe) : nullptr;
+            ggml_tensor* k_rope = q_rope != nullptr ? try_rope_only(ctx, k, pe) : nullptr;
+            if (q_rope != nullptr && k_rope != nullptr) {
+                x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_rope, k_rope, v, num_heads, mask, true, ctx->flash_attn_enabled);
+            } else {
+                x = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
+            }
 
             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
             return x;
+        }
+
+        // Rope alone through the fused qknorm+rope op. That op RMS-normalises each HEAD,
+        // while Wan's norm_q/norm_k already ran over the whole dim. With eps far above any
+        // row's mean square, f32 rounds mean(x^2) + eps to eps exactly, so its norm is a
+        // uniform x / sqrt(eps), undone by a weight of sqrt(eps). Same interleaved pairs
+        // and the same pe table as Rope::apply_rope(rope_interleaved = true).
+        static ggml_tensor* try_rope_only(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe) {
+            // x: [N, n_token, n_head, d_head]
+            if (ctx->backend == nullptr || x->type != GGML_TYPE_F32) {
+                return nullptr;
+            }
+            const float eps  = 1e12f;
+            ggml_tensor* w   = ggml_fill(ctx->ggml_ctx, ggml_view_1d(ctx->ggml_ctx, x, x->ne[0], 0), 1e6f);
+            ggml_tensor* out = ggml_qknorm_rope(ctx->ggml_ctx, x, w, pe, eps);
+            return ggml_backend_supports_op(ctx->backend, w) && ggml_backend_supports_op(ctx->backend, out) ? out : nullptr;
         }
     };
 
@@ -297,6 +323,66 @@ namespace WAN {
         return x;
     }
 
+    // x + x*scale + shift and x + y*gate through FLUX's fused ops when e is one row per
+    // batch ([N, 1, dim], Wan 2.1 / A14B); Wan 2.2 TI2V's per-frame e ([N, T, 1, dim]) and
+    // backends without the ops keep the composed form. The broadcast MUL/ADD were HTP-slow.
+    static ggml_tensor* modulate_mul(ggml_context* ctx, ggml_tensor* x, ggml_tensor* e);
+    static ggml_tensor* modulate_fused(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* shift, ggml_tensor* scale) {
+        if (ggml_n_dims(scale) < 3 && ggml_n_dims(shift) < 3) {
+            return Flux::modulate(ctx, x, shift, scale, true);
+        }
+        x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, x, scale));
+        return modulate_add(ctx->ggml_ctx, x, shift);
+    }
+
+    static ggml_tensor* gated_residual_fused(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* y, ggml_tensor* gate) {
+        if (ggml_n_dims(gate) < 3) {
+            return Flux::gated_residual(ctx, x, y, gate);
+        }
+        return ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, gate));
+    }
+
+    static ggml_tensor* token_range(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t start, int64_t len) {
+        return ggml_cont(ctx->ggml_ctx, ggml_view_3d(ctx->ggml_ctx, x, x->ne[0], len, x->ne[2], x->nb[1], x->nb[2], start * x->nb[1]));
+    }
+
+    // Two token ranges, [0, split) and [split, n_token), each with its own modulation: Wan 2.2
+    // TI2V image to video (frame 0 at t = 0, the rest at t) in place of a per-frame e. One
+    // fused op on backends that have it; the two ranges composed and concatenated elsewhere.
+    static ggml_tensor* modulate_split(GGMLRunnerContext* ctx, ggml_tensor* x,
+                                       ggml_tensor* shift0, ggml_tensor* scale0, int64_t split,
+                                       ggml_tensor* shift1, ggml_tensor* scale1) {
+        if (shift1 == nullptr || split <= 0) {
+            return modulate_fused(ctx, x, shift0, scale0);
+        }
+        if (ctx->backend != nullptr) {
+            ggml_tensor* out = ggml_modulate(ctx->ggml_ctx, x, scale0, shift0, split, scale1, shift1);
+            if (ggml_backend_supports_op(ctx->backend, out)) {
+                return out;
+            }
+        }
+        auto a = modulate_fused(ctx, token_range(ctx, x, 0, split), shift0, scale0);
+        auto b = modulate_fused(ctx, token_range(ctx, x, split, x->ne[1] - split), shift1, scale1);
+        return ggml_concat(ctx->ggml_ctx, a, b, 1);
+    }
+
+    static ggml_tensor* gated_residual_split(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* y,
+                                             ggml_tensor* gate0, int64_t split, ggml_tensor* gate1) {
+        if (gate1 == nullptr || split <= 0) {
+            return gated_residual_fused(ctx, x, y, gate0);
+        }
+        if (ctx->backend != nullptr) {
+            ggml_tensor* out = ggml_gated_residual(ctx->ggml_ctx, x, y, gate0, split, gate1);
+            if (ggml_backend_supports_op(ctx->backend, out)) {
+                return out;
+            }
+        }
+        auto a = gated_residual_fused(ctx, token_range(ctx, x, 0, split), token_range(ctx, y, 0, split), gate0);
+        auto b = gated_residual_fused(ctx, token_range(ctx, x, split, x->ne[1] - split),
+                                      token_range(ctx, y, split, y->ne[1] - split), gate1);
+        return ggml_concat(ctx->ggml_ctx, a, b, 1);
+    }
+
     static ggml_tensor* modulate_mul(ggml_context* ctx, ggml_tensor* x, ggml_tensor* e) {
         // x: [N, n_token, dim]
         // e: [N, 1, dim] or [N, T, 1, dim]
@@ -354,15 +440,22 @@ namespace WAN {
                                      ggml_tensor* e,
                                      ggml_tensor* pe,
                                      ggml_tensor* context,
-                                     int64_t context_img_len = 257) {
+                                     int64_t context_img_len = 257,
+                                     ggml_tensor* e_rest     = nullptr,
+                                     int64_t split           = 0) {
             // x: [N, n_token, dim]
             // e: [N, 6, dim] or [N, T, 6, dim]
+            // e_rest: [N, 6, dim] for tokens [split, n_token) when e covers only [0, split)
             // context: [N, context_img_len + context_txt_len, dim]
             // return [N, n_token, dim]
 
             auto modulation = params["modulation"];
             e               = ggml_add(ctx->ggml_ctx, e, modulation);  // [N, 6, dim] or [N, T, 6, dim]
             auto es         = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);  // ([N, 1, dim], ...) or [N, T, 1, dim]
+            std::vector<ggml_tensor*> rs(6, nullptr);
+            if (e_rest != nullptr) {
+                rs = ggml_ext_chunk(ctx->ggml_ctx, ggml_add(ctx->ggml_ctx, e_rest, modulation), 6, 1);
+            }
 
             auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
             auto self_attn  = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
@@ -374,11 +467,10 @@ namespace WAN {
 
             // self-attention
             auto y = norm1->forward(ctx, x);
-            y      = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[1]));
-            y      = modulate_add(ctx->ggml_ctx, y, es[0]);
+            y      = modulate_split(ctx, y, es[0], es[1], split, rs[0], rs[1]);
             y      = self_attn->forward(ctx, y, pe);
 
-            x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[2]));
+            x = gated_residual_split(ctx, x, y, es[2], split, rs[2]);
 
             // cross-attention
             x = ggml_add(ctx->ggml_ctx,
@@ -387,14 +479,13 @@ namespace WAN {
 
             // ffn
             y = norm2->forward(ctx, x);
-            y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
-            y = modulate_add(ctx->ggml_ctx, y, es[3]);
+            y = modulate_split(ctx, y, es[3], es[4], split, rs[3], rs[4]);
 
             y = ffn_0->forward(ctx, y);
             y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
             y = ffn_2->forward(ctx, y);
 
-            x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
+            x = gated_residual_split(ctx, x, y, es[5], split, rs[5]);
 
             return x;
         }
@@ -474,24 +565,32 @@ namespace WAN {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
-                             ggml_tensor* e) {
+                             ggml_tensor* e,
+                             ggml_tensor* e_rest = nullptr,
+                             int64_t split       = 0) {
             // x: [N, n_token, dim]
             // e: [N, dim] or [N, T, dim]
+            // e_rest: [N, dim] for tokens [split, n_token) when e covers only [0, split)
             // return [N, n_token, out_dim]
 
             auto modulation = params["modulation"];
-            e               = ggml_reshape_4d(ctx->ggml_ctx, e, e->ne[0], 1, e->ne[1], e->ne[2]);  // [N, 1, dim] or [N, T, 1, dim]
-            e               = ggml_repeat_4d(ctx->ggml_ctx, e, e->ne[0], 2, e->ne[2], e->ne[3]);   // [N, 2, dim] or [N, T, 2, dim]
-
-            e       = ggml_add(ctx->ggml_ctx, e, modulation);  // [N, 2, dim] or [N, T, 2, dim]
-            auto es = ggml_ext_chunk(ctx->ggml_ctx, e, 2, 1);  // ([N, 1, dim], ...) or ([N, T, 1, dim], ...)
+            auto chunks     = [&](ggml_tensor* t) {
+                t = ggml_reshape_4d(ctx->ggml_ctx, t, t->ne[0], 1, t->ne[1], t->ne[2]);  // [N, 1, dim] or [N, T, 1, dim]
+                t = ggml_repeat_4d(ctx->ggml_ctx, t, t->ne[0], 2, t->ne[2], t->ne[3]);   // [N, 2, dim] or [N, T, 2, dim]
+                t = ggml_add(ctx->ggml_ctx, t, modulation);                               // [N, 2, dim] or [N, T, 2, dim]
+                return ggml_ext_chunk(ctx->ggml_ctx, t, 2, 1);                           // ([N, 1, dim], ...) or ([N, T, 1, dim], ...)
+            };
+            auto es = chunks(e);
+            std::vector<ggml_tensor*> rs(2, nullptr);
+            if (e_rest != nullptr) {
+                rs = chunks(e_rest);
+            }
 
             auto norm = std::dynamic_pointer_cast<LayerNorm>(blocks["norm"]);
             auto head = std::dynamic_pointer_cast<Linear>(blocks["head"]);
 
             x = norm->forward(ctx, x);
-            x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, x, es[1]));
-            x = modulate_add(ctx->ggml_ctx, x, es[0]);
+            x = modulate_split(ctx, x, es[0], es[1], split, rs[0], rs[1]);
             x = head->forward(ctx, x);
             return x;
         }
@@ -706,6 +805,7 @@ namespace WAN {
 
             // patch_embedding
             x = patch_embedding->forward(ctx, x);                                                    // [N*dim, t_len, h_len, w_len]
+            int64_t frame_tokens = x->ne[0] * x->ne[1];                                              // h_len*w_len: one latent frame
             x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
 
@@ -743,15 +843,32 @@ namespace WAN {
                 }
             }
 
-            // time_embedding
-            auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
-            e      = time_embedding_0->forward(ctx, e);
-            e      = ggml_silu_inplace(ctx->ggml_ctx, e);
-            e      = time_embedding_2->forward(ctx, e);  // [N, dim] or [N, T, dim]
-
-            // time_projection
-            auto e0 = ggml_silu(ctx->ggml_ctx, e);
-            e0      = time_projection_1->forward(ctx, e0);
+            // time_embedding + time_projection. Two timesteps on a backend mean "frame 0, then
+            // every other frame" (Wan 2.2 TI2V image to video, process_timesteps): two single-row
+            // embeddings, and the blocks modulate two token ranges split at frame 0. The
+            // per-frame [N, T, 6, dim] path rendered noise on the Hexagon backend.
+            auto embed_time = [&](ggml_tensor* t) -> std::pair<ggml_tensor*, ggml_tensor*> {
+                auto te = ggml_ext_timestep_embedding(ctx->ggml_ctx, t, config.freq_dim);
+                te      = time_embedding_0->forward(ctx, te);
+                te      = ggml_silu_inplace(ctx->ggml_ctx, te);
+                te      = time_embedding_2->forward(ctx, te);  // [N, dim] or [N, T, dim]
+                auto p  = ggml_silu(ctx->ggml_ctx, te);
+                p       = time_projection_1->forward(ctx, p);
+                return {te, p};
+            };
+            ggml_tensor* e       = nullptr;
+            ggml_tensor* e0      = nullptr;
+            ggml_tensor* e_rest  = nullptr;
+            ggml_tensor* e0_rest = nullptr;
+            if (config.in_dim == 48 && N == 1 && timestep->ne[0] == 2 && frame_tokens > 0 &&
+                x->ne[1] > frame_tokens) {
+                std::tie(e, e0)           = embed_time(ggml_view_1d(ctx->ggml_ctx, timestep, 1, 0));
+                std::tie(e_rest, e0_rest) = embed_time(ggml_view_1d(ctx->ggml_ctx, timestep, 1, timestep->nb[0]));
+                e0_rest                   = ggml_reshape_4d(ctx->ggml_ctx, e0_rest, e0_rest->ne[0] / 6, 6, e0_rest->ne[1], e0_rest->ne[2]);
+            } else {
+                std::tie(e, e0) = embed_time(timestep);
+                frame_tokens    = 0;
+            }
             e0      = ggml_reshape_4d(ctx->ggml_ctx, e0, e0->ne[0] / 6, 6, e0->ne[1], e0->ne[2]);  //  [N, 6, dim] or [N, T, 6, dim]
 
             context = text_embedding_0->forward(ctx, context);
@@ -795,7 +912,7 @@ namespace WAN {
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
 
-                x = block->forward(ctx, x, e0, pe, context, context_img_len);
+                x = block->forward(ctx, x, e0, pe, context, context_img_len, e0_rest, frame_tokens);
 
                 auto iter = config.vace_layers_mapping.find(i);
                 if (iter != config.vace_layers_mapping.end()) {
@@ -822,7 +939,7 @@ namespace WAN {
                 }
             }
 
-            x = head->forward(ctx, x, e);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
+            x = head->forward(ctx, x, e, e_rest, frame_tokens);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
 
             return x;
         }

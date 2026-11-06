@@ -1998,6 +1998,14 @@ std::vector<float> StableDiffusionGGML::process_timesteps(const std::vector<floa
                 }
             }
         }
+        if (!new_timesteps.empty() && std::all_of(new_timesteps.begin(), new_timesteps.end(),
+                [&](float t) { return t == new_timesteps[0]; })) {
+            return {new_timesteps[0]};
+        }
+        if (new_timesteps.size() > 2 && std::all_of(new_timesteps.begin() + 1, new_timesteps.end(),
+                [&](float t) { return t == new_timesteps[1]; })) {
+            return {new_timesteps[0], new_timesteps[1]};
+        }
         return new_timesteps;
     }
     if (diffusion_model->get_desc() == "Wan2.2-S2V-14B") {

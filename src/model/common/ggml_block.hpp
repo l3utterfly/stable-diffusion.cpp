@@ -608,7 +608,7 @@ public:
     // VAE downsamples an input with one pixel of zero padding at the right/bottom.
     ggml_tensor* try_forward_downsample2(GGMLRunnerContext* ctx, ggml_tensor* x, bool vae) {
         const int pad = vae ? 0 : 1;
-        if (!bias || has_weight_adapter(ctx) || ctx->circular_x_enabled || ctx->circular_y_enabled ||
+        if (has_weight_adapter(ctx) || ctx->circular_x_enabled || ctx->circular_y_enabled ||
             (!std::isfinite(scale) || scale == 0.f) || kernel_size != std::make_pair(3, 3) || stride != std::make_pair(2, 2) ||
             padding != std::make_pair(pad, pad) || dilation != std::make_pair(1, 1) ||
             (vae && (!ctx->conv2d_direct_enabled || x->ne[0] < 2 || x->ne[1] < 2)) ||
@@ -616,7 +616,7 @@ public:
             return nullptr;
         }
         auto c = ctx->ggml_ctx;
-        auto full = scale == 1.f
+        auto full = bias && scale == 1.f
                         ? ggml_conv_2d_direct_bias(c, params["weight"], x, params["bias"], 1, 1, 1, 1, 1, 1)
                         : ggml_conv_2d_direct(c, params["weight"], ggml_ext_scale(c, x, scale), 1, 1, 1, 1, 1, 1);
         if (!ggml_backend_supports_op(ctx->backend, full)) {
@@ -631,7 +631,7 @@ public:
         auto out = ggml_reshape_4d(c, ggml_cont(c, view), ow, oh, full->ne[2], full->ne[3]);
         if (scale != 1.f) {
             out = ggml_ext_scale(c, out, 1.f / scale);
-            out = add_scaled_bias(ctx, out, params["bias"]);
+            if (bias) out = add_scaled_bias(ctx, out, params["bias"]);
         }
         return out;
     }

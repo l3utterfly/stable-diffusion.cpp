@@ -1,0 +1,15 @@
+Wan mobile optimizations adapted from Nightmare Mobile
+Copyright (c) 2026 Abraham Paul Jaison
+
+Source: https://github.com/AbrahamPaulJ/nightmare-mobile
+Revision: 30e99027f51dbfca4d77364c9398a41ed70efe3e
+Patches: backend-patches/dit/004, 009, 010, 013 and 016.
+
+Nightmare Mobile declares Creative Commons Attribution-NonCommercial 4.0
+International for its work: https://creativecommons.org/licenses/by-nc/4.0/
+Original license: https://github.com/AbrahamPaulJ/nightmare-mobile/blob/30e99027f51dbfca4d77364c9398a41ed70efe3e/LICENSE
+
+Modified here for the current Flux helper API, empty-token handling and the
+newer Wan S2V prelude, with bias-free downsampling added to the existing HTP
+helper. The original upstream licenses remain applicable to
+the pre-existing stable-diffusion.cpp code.
