@@ -385,10 +385,12 @@ class TinyVideoEncoder : public UnaryBlock {
     int patch_size  = 1;
 
 public:
-    int t_downscale = 1;
+    int t_downscale        = 1;
+    int first_layer_stride = 1;
     TinyVideoEncoder(int z_channels = 4, int patch_size = 1, std::vector<bool> time_downscale = {true, true, false})
         : z_channels(z_channels), patch_size(patch_size) {
-        t_downscale = 1;
+        t_downscale        = 1;
+        first_layer_stride = !time_downscale.empty() && time_downscale[0] ? 2 : 1;
         for (bool downscale : time_downscale) {
             if (downscale) {
                 t_downscale *= 2;
@@ -408,18 +410,41 @@ public:
         blocks[std::to_string(index)] = std::shared_ptr<GGMLBlock>(new Conv2d(hidden, z_channels, {3, 3}, {1, 1}, {1, 1}));
     }
 
+    // FIRST_LAYER is the stem and the first layer, which run at full resolution and hold nearly all of the
+    // memory; REST is everything after it, fed FIRST_LAYER's output.
+    enum class Part {
+        WHOLE,
+        FIRST_LAYER,
+        REST,
+    };
+
+    // Each MemBlock reads one frame back, so the first layer's output frame j reads input frames
+    // [first_layer_stride * (j - num_blocks), first_layer_stride * (j + 1) - 1].
+    int first_layer_lookback_frames() const {
+        return first_layer_stride * num_blocks;
+    }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* z) override {
-        auto first_conv = std::dynamic_pointer_cast<Conv2d>(blocks["0"]);
+        return forward_part(ctx, z, Part::WHOLE);
+    }
 
-        if (patch_size > 1) {
-            z = patchify(ctx->ggml_ctx, z, patch_size, 1);
+    ggml_tensor* forward_part(GGMLRunnerContext* ctx, ggml_tensor* z, Part part) {
+        ggml_tensor* h = z;
+        if (part != Part::REST) {
+            auto first_conv = std::dynamic_pointer_cast<Conv2d>(blocks["0"]);
+            if (patch_size > 1) {
+                h = patchify(ctx->ggml_ctx, h, patch_size, 1);
+            }
+            h = first_conv->forward(ctx, h);
+            h = ggml_relu_inplace(ctx->ggml_ctx, h);
         }
-
-        auto h = first_conv->forward(ctx, z);
-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
 
         int index = 2;
         for (int i = 0; i < num_layers; i++) {
+            if ((part == Part::FIRST_LAYER && i > 0) || (part == Part::REST && i == 0)) {
+                index += 2 + num_blocks;
+                continue;
+            }
             auto pool = std::dynamic_pointer_cast<UnaryBlock>(blocks[std::to_string(index++)]);
             auto conv = std::dynamic_pointer_cast<UnaryBlock>(blocks[std::to_string(index++)]);
 
@@ -431,6 +456,9 @@ public:
                 mem        = ggml_view_4d(ctx->ggml_ctx, mem, h->ne[0], h->ne[1], h->ne[2], h->ne[3], h->nb[1], h->nb[2], h->nb[3], 0);
                 h          = block->forward(ctx, h, mem);
             }
+        }
+        if (part == Part::FIRST_LAYER) {
+            return h;
         }
         auto last_conv = std::dynamic_pointer_cast<Conv2d>(blocks[std::to_string(index)]);
         h              = last_conv->forward(ctx, h);
@@ -674,6 +702,18 @@ public:
         return ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, out, 0, 1, 3, 2));
     }
 
+    std::shared_ptr<TinyVideoEncoder> video_encoder() {
+        return std::dynamic_pointer_cast<TinyVideoEncoder>(blocks["encoder"]);
+    }
+
+    // One part of the encoder, in and out as (W, H, T, C). The caller pads the clip to a multiple of
+    // t_downscale first.
+    ggml_tensor* encode_part(GGMLRunnerContext* ctx, ggml_tensor* x, TinyVideoEncoder::Part part) {
+        x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));
+        x = video_encoder()->forward_part(ctx, x, part);
+        return ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));
+    }
+
     ggml_tensor* encode(GGMLRunnerContext* ctx, ggml_tensor* x) {
         if (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version) || (sd_version_is_minimax_h3(version) && x->ne[3] > 1)) {
             // (W, H, T, C) -> (W, H, C, T)
@@ -849,7 +889,10 @@ struct TinyVideoAutoEncoder : public VAE {
     }
 
     bool supports_temporal_tiling(VAETemporalDirection direction) const override {
-        return direction == VAETemporalDirection::DECODE && !sd_version_is_minimax_h3(version);
+        if (direction == VAETemporalDirection::ENCODE) {
+            return !decode_only && (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version));
+        }
+        return !sd_version_is_minimax_h3(version);
     }
 
     int get_temporal_tile_output_scale(VAETemporalDirection direction) const override {
@@ -884,12 +927,21 @@ struct TinyVideoAutoEncoder : public VAE {
         return taehv.z_channels;
     }
 
+    TinyVideoEncoder::Part encode_part = TinyVideoEncoder::Part::WHOLE;
+
     ggml_cgraph* build_graph(const sd::Tensor<float>& z_tensor, bool decode_graph) {
-        ggml_cgraph* gf  = decode_graph && is_wide ? ggml_new_graph_custom(compute_ctx, 4096, false)
-                                                   : ggml_new_graph(compute_ctx);
-        ggml_tensor* z   = make_input(z_tensor);
-        auto runner_ctx  = get_context();
-        ggml_tensor* out = decode_graph ? taehv.decode(&runner_ctx, z) : taehv.encode(&runner_ctx, z);
+        ggml_cgraph* gf = decode_graph && is_wide ? ggml_new_graph_custom(compute_ctx, 4096, false)
+                                                  : ggml_new_graph(compute_ctx);
+        ggml_tensor* z  = make_input(z_tensor);
+        auto runner_ctx = get_context();
+        ggml_tensor* out;
+        if (decode_graph) {
+            out = taehv.decode(&runner_ctx, z);
+        } else if (encode_part != TinyVideoEncoder::Part::WHOLE) {
+            out = taehv.encode_part(&runner_ctx, z, encode_part);
+        } else {
+            out = taehv.encode(&runner_ctx, z);
+        }
         ggml_build_forward_expand(gf, out);
         return gf;
     }
@@ -902,6 +954,69 @@ struct TinyVideoAutoEncoder : public VAE {
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), z_tensor.dim());
+    }
+
+    // The encoder in two parts, the first in overlapped time chunks. Exact: a chunk that starts the first
+    // layer's look-back early leaves every kept output frame untouched by the chunk's zero "past". The
+    // rest then runs on the whole clip (a quarter of the area at half the frames).
+    sd::Tensor<float> encode_chunked(const int n_threads, const sd::Tensor<float>& input, int chunk) {
+        auto encoder      = taehv.video_encoder();
+        const int t_down  = encoder->t_downscale;
+        const int stride0 = encoder->first_layer_stride;
+        const int overlap = encoder->first_layer_lookback_frames();
+
+        sd::Tensor<float> x = input;
+        int64_t frames      = x.shape()[2];
+        if (frames % t_down) {
+            auto last = sd::ops::slice(x, 2, frames - 1, frames);
+            for (int64_t i = frames % t_down; i < t_down; i++) {
+                x = sd::ops::concat(x, last, 2);
+            }
+            frames = x.shape()[2];
+        }
+        const int content = std::max(stride0, (chunk - overlap) / stride0 * stride0);
+        LOG_INFO("%s encode: %lld frames in chunks of %d (+%d overlap)",
+                 get_desc().c_str(), (long long)frames, content, overlap);
+
+        sd::Tensor<float> mid;
+        encode_part = TinyVideoEncoder::Part::FIRST_LAYER;
+        for (int64_t start = 0; start < frames; start += content) {
+            const int64_t from = std::max<int64_t>(0, start - overlap);
+            const int64_t end  = std::min<int64_t>(frames, start + content);
+            auto part          = _compute(n_threads, sd::ops::slice(x, 2, from, end), false);
+            if (part.empty()) {
+                encode_part = TinyVideoEncoder::Part::WHOLE;
+                return {};
+            }
+            if (from < start) {
+                part = sd::ops::slice(part, 2, (start - from) / stride0, part.shape()[2]);
+            }
+            mid = mid.empty() ? std::move(part) : sd::ops::concat(mid, part, 2);
+        }
+        encode_part = TinyVideoEncoder::Part::REST;
+        auto out    = _compute(n_threads, mid, false);
+        encode_part = TinyVideoEncoder::Part::WHOLE;
+        return out;
+    }
+
+    sd::Tensor<float> _compute_temporal_tiled(const int n_threads,
+                                              const sd::Tensor<float>& input,
+                                              VAETemporalDirection direction,
+                                              const VAETemporalTilingConfig& config) override {
+        if (direction == VAETemporalDirection::DECODE) {
+            return VAE::_compute_temporal_tiled(n_threads, input, direction, config);
+        }
+        auto encoder         = taehv.video_encoder();
+        const int min_frames = encoder->first_layer_lookback_frames() + encoder->first_layer_stride;
+        int chunk            = config.encode_frames;
+        const int64_t area   = input.shape()[0] * input.shape()[1];
+        if (config.encode_mpx > 0.f && area > 0) {
+            chunk = std::max(min_frames, static_cast<int>(config.encode_mpx * 1e6 / static_cast<double>(area)));
+        }
+        if (chunk > 0 && input.shape()[2] > chunk) {
+            return encode_chunked(n_threads, input, std::max(chunk, min_frames));
+        }
+        return _compute(n_threads, input, false);
     }
 };
 
