@@ -19,7 +19,24 @@
 
 namespace WAN {
 
-    constexpr int WAN_GRAPH_SIZE = 10240;
+    // Room for token-chunked blocks (wan_token_chunk): 40 blocks x up to 16 chunks x two passes.
+    constexpr int WAN_GRAPH_SIZE = 65536;
+
+    // A Wan block can run a TOKEN CHUNK at a time. With the weights streamed a block at a time, what one
+    // block holds is activations, all f32 and full length: for Wan 2.2 A14B (dim 5120) each is ~660 MB at
+    // 1280x720 x33 (32,400 tokens), and with several alive a block needed ~6 GB. Only self-attention mixes
+    // tokens, so the block runs in two passes over chunks: every chunk's keys and values (roped, f16), then
+    // per chunk its queries against all of them, the output projection, the residual, the cross-attention
+    // and the FFN. The same math, so the same clip. 2048 needed MORE memory than 4096 (more joins); the 5B
+    // (dim 3072) is left whole.
+    static int64_t wan_token_chunk(int64_t dim) {
+        return dim >= 5120 ? 4096 : 0;
+    }
+
+    // Rows [start, start + len) of a rope table [2, 2, d_head/2, n_token].
+    static ggml_tensor* wan_pe_rows(ggml_context* ctx, ggml_tensor* pe, int64_t start, int64_t len) {
+        return ggml_view_4d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], len, pe->nb[1], pe->nb[2], pe->nb[3], start * pe->nb[3]);
+    }
 
     struct WanConfig {
         std::string model_type                  = "t2v";
@@ -178,6 +195,49 @@ namespace WAN {
 
             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
             return x;
+        }
+
+        // One chunk's roped keys and values for flash attention, f16 [d_head, len, n_head] each. A null pair
+        // where the fused rope is not on the backend.
+        std::pair<ggml_tensor*, ggml_tensor*> kv_chunk(GGMLRunnerContext* ctx, ggml_tensor* y, ggml_tensor* pe) {
+            auto gc     = ctx->ggml_ctx;
+            int64_t len = y->ne[1];
+            auto k_proj = std::dynamic_pointer_cast<Linear>(blocks["k"]);
+            auto v_proj = std::dynamic_pointer_cast<Linear>(blocks["v"]);
+            auto norm_k = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_k"]);
+            auto k      = ggml_reshape_4d(gc, norm_k->forward(ctx, k_proj->forward(ctx, y)), head_dim, num_heads, len, 1);
+            auto v      = ggml_reshape_4d(gc, v_proj->forward(ctx, y), head_dim, num_heads, len, 1);
+            auto k_rope = try_rope_only(ctx, k, pe);
+            if (k_rope == nullptr) {
+                return {nullptr, nullptr};
+            }
+            v          = ggml_permute(gc, v, 0, 2, 1, 3);
+            auto v_f16 = ggml_cast(gc, v, GGML_TYPE_F16);
+            if (!ggml_backend_supports_op(ctx->backend, v_f16)) {
+                v_f16 = ggml_cast(gc, ggml_cont(gc, v), GGML_TYPE_F16);
+            }
+            return {ggml_cast(gc, k_rope, GGML_TYPE_F16), ggml_reshape_3d(gc, v_f16, head_dim, len, num_heads)};
+        }
+
+        // One chunk's queries against every key and value (from kv_chunk), then the output projection:
+        // [N, len, dim]. Null where the fused rope or flash attention is not on the backend.
+        ggml_tensor* attend_chunk(GGMLRunnerContext* ctx, ggml_tensor* y, ggml_tensor* pe, ggml_tensor* k, ggml_tensor* v) {
+            auto gc     = ctx->ggml_ctx;
+            int64_t len = y->ne[1];
+            auto q_proj = std::dynamic_pointer_cast<Linear>(blocks["q"]);
+            auto o_proj = std::dynamic_pointer_cast<Linear>(blocks["o"]);
+            auto norm_q = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_q"]);
+            auto q      = ggml_reshape_4d(gc, norm_q->forward(ctx, q_proj->forward(ctx, y)), head_dim, num_heads, len, 1);
+            auto q_rope = try_rope_only(ctx, q, pe);
+            if (q_rope == nullptr) {
+                return nullptr;
+            }
+            auto attn = ggml_flash_attn_ext(gc, q_rope, k, v, nullptr, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0, 0);
+            if (!ggml_backend_supports_op(ctx->backend, attn)) {
+                return nullptr;
+            }
+            ggml_prec_set_acc(attn, GGML_PREC_F32);
+            return o_proj->forward(ctx, ggml_reshape_3d(gc, attn, head_dim * num_heads, len, 1));  // [d_head, n_head, len] -> [dim, len]
         }
 
         // Rope alone through the fused qknorm+rope op. That op RMS-normalises each HEAD,
@@ -476,6 +536,14 @@ namespace WAN {
             auto ffn_0      = std::dynamic_pointer_cast<Linear>(blocks["ffn.0"]);
             auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
 
+            const int64_t chunk = wan_token_chunk(x->ne[0]);
+            if (chunk > 0 && x->ne[1] > chunk && x->ne[2] == 1 && e_rest == nullptr && ggml_n_dims(es[0]) <= 2 &&
+                ctx->backend != nullptr && ctx->flash_attn_enabled) {
+                if (ggml_tensor* out = forward_chunked(ctx, x, es, pe, context, context_img_len, chunk)) {
+                    return out;
+                }
+            }
+
             // self-attention
             auto y = norm1->forward(ctx, x);
             y      = modulate_split(ctx, y, es[0], es[1], split, rs[0], rs[1]);
@@ -499,6 +567,56 @@ namespace WAN {
             x = gated_residual_split(ctx, x, y, es[5], split, rs[5]);
 
             return x;
+        }
+
+        // The block in token chunks (wan_token_chunk); null to fall back to the whole block.
+        ggml_tensor* forward_chunked(GGMLRunnerContext* ctx,
+                                     ggml_tensor* x,
+                                     const std::vector<ggml_tensor*>& es,
+                                     ggml_tensor* pe,
+                                     ggml_tensor* context,
+                                     int64_t context_img_len,
+                                     int64_t chunk) {
+            auto gc         = ctx->ggml_ctx;
+            auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+            auto self_attn  = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            auto norm3      = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm3"]);
+            auto cross_attn = std::dynamic_pointer_cast<WanCrossAttention>(blocks["cross_attn"]);
+            auto norm2      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm2"]);
+            auto ffn_0      = std::dynamic_pointer_cast<Linear>(blocks["ffn.0"]);
+            auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
+            const int64_t n = x->ne[1];
+
+            ggml_tensor* k = nullptr;
+            ggml_tensor* v = nullptr;
+            for (int64_t start = 0; start < n; start += chunk) {
+                const int64_t len = std::min(chunk, n - start);
+                auto y            = modulate_fused(ctx, norm1->forward(ctx, token_range(ctx, x, start, len)), es[0], es[1]);
+                auto kv           = self_attn->kv_chunk(ctx, y, wan_pe_rows(gc, pe, start, len));
+                if (kv.first == nullptr) {
+                    return nullptr;
+                }
+                k = k == nullptr ? kv.first : ggml_concat(gc, k, kv.first, 1);
+                v = v == nullptr ? kv.second : ggml_concat(gc, v, kv.second, 1);
+            }
+
+            ggml_tensor* out = nullptr;
+            for (int64_t start = 0; start < n; start += chunk) {
+                const int64_t len = std::min(chunk, n - start);
+                auto xc           = token_range(ctx, x, start, len);
+                auto y            = modulate_fused(ctx, norm1->forward(ctx, xc), es[0], es[1]);
+                y                 = self_attn->attend_chunk(ctx, y, wan_pe_rows(gc, pe, start, len), k, v);
+                if (y == nullptr) {
+                    return nullptr;
+                }
+                xc  = gated_residual_fused(ctx, xc, y, es[2]);
+                xc  = ggml_add(gc, xc, cross_attn->forward(ctx, norm3->forward(ctx, xc), context, context_img_len));
+                y   = modulate_fused(ctx, norm2->forward(ctx, xc), es[3], es[4]);
+                y   = ffn_2->forward(ctx, ggml_ext_gelu(gc, ffn_0->forward(ctx, y), true));
+                xc  = gated_residual_fused(ctx, xc, y, es[5]);
+                out = out == nullptr ? xc : ggml_concat(gc, out, xc, 1);
+            }
+            return out;
         }
     };
 
