@@ -282,6 +282,7 @@ public:
     void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     WeightResidencyInfo inspect_compute_backend_params(
         const std::vector<ggml_tensor*>& tensors) const override;
+    bool can_prepare_params_during_compute(const std::vector<ggml_tensor*>& tensors) const override;
     void update_runtime_residency(uintptr_t owner_id,
                                   ggml_backend_t compute_backend,
                                   size_t resident_bytes) override;

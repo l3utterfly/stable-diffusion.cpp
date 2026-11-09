@@ -1743,6 +1743,28 @@ WeightResidencyInfo ModelManager::inspect_compute_backend_params(
     return info;
 }
 
+bool ModelManager::can_prepare_params_during_compute(const std::vector<ggml_tensor*>& tensors) const {
+    // LoRA merges and staging copies run graphs or synchronize on the compute backend.
+    if (!loras_.empty() || applying_loras_) {
+        return false;
+    }
+    std::vector<TensorState*> states;
+    if (!resolve_required_tensor_states(tensors, states)) {
+        return false;
+    }
+    for (TensorState* state : states) {
+        if (state == nullptr || should_ignore(*state) || is_optional_missing_tensor(state->name)) {
+            continue;
+        }
+        if (state->usage_op == GGML_OP_CUSTOM || state->compute_backend == nullptr ||
+            sd_backend_is_cpu(state->compute_backend) || state->compute_backend != state->params_backend ||
+            split_buffer_type_for(*state) != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ModelManager::set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) {
     workspace_reclaimers_[owner_id] = std::move(reclaim);
 }

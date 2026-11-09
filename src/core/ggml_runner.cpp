@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <exception>
 #include <map>
+#include <thread>
 #include <utility>
 
 #include "core/ggml_extend.h"
@@ -1042,7 +1043,24 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         }
         LOG_DEBUG("%s executing segment %zu/%zu: %s", get_desc().c_str(),
                   index + 1, plan.segments.size(), segment.group_name.c_str());
-        if (!execute_segment(segment_graph, n_threads, [&]() { weights.submit_next(); })) {
+        bool executed = false;
+        if (!last && !prefetch_requests.empty() && weights.can_preload_next(index)) {
+            // Synchronous weight loads would otherwise leave the device idle between segments.
+            std::thread worker([&]() {
+                try {
+                    executed = execute_segment(segment_graph, n_threads, [&]() { weights.submit_next(); });
+                } catch (...) {
+                    executed = false;
+                }
+            });
+            sd_trace_stage(get_desc().c_str(), "weights-preload.begin");
+            const bool preloaded = weights.preload_next(index, prefetch_requests.front());
+            sd_trace_stage(get_desc().c_str(), preloaded ? "weights-preload.end" : "weights-preload.failed");
+            worker.join();
+        } else {
+            executed = execute_segment(segment_graph, n_threads, [&]() { weights.submit_next(); });
+        }
+        if (!executed) {
             return fail_segment("execution");
         }
         auto cache_status = cache_.capture(segment_graph);

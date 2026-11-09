@@ -28,10 +28,15 @@ namespace sd {
         std::vector<std::vector<ggml_tensor*>> segment_params_;
         std::vector<ggml_tensor*> queued_params_;
         std::vector<ggml_tensor*> pinned_params_;
+        // Next segment's weights, loaded and pinned while the current segment executes.
+        std::vector<ggml_tensor*> preloaded_params_;
         size_t queued_segment_ = SIZE_MAX;
         bool enabled_          = true;
+        bool preload_enabled_  = true;
 
         size_t next_parameter_segment(size_t segment_index) const;
+        std::vector<ggml_tensor*> next_missing_params(size_t segment_index, size_t next_segment) const;
+        void release_preloaded();
         std::vector<std::vector<ggml_tensor*>> preferred_eviction_order() const;
         void disable();
         void activate(size_t segment_index);
@@ -57,6 +62,13 @@ namespace sd {
         void enqueue_next(size_t segment_index,
                           const DeviceMemoryRequest& request);
         void submit_next();
+        // Backends without asynchronous prefetch (weights read straight into the
+        // compute backend, e.g. params_backend=disk on HTP) can still overlap the
+        // next segment's load with this segment's execution on another thread.
+        bool can_preload_next(size_t segment_index);
+        // Loads and pins the next segment's weights on the calling thread. Best
+        // effort: on failure segment_start loads them as before.
+        bool preload_next(size_t segment_index, const DeviceMemoryRequest& request);
     };
 }
 

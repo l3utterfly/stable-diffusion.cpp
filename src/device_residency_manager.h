@@ -54,6 +54,9 @@ struct DeviceResidencyManager {
     virtual void evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors)   = 0;
     virtual WeightResidencyInfo inspect_compute_backend_params(
         const std::vector<ggml_tensor*>& tensors) const          = 0;
+    // True when prepare_params(tensors) only allocates compute-backend buffers and
+    // reads from disk on the CPU, so it may run while that backend executes a graph.
+    virtual bool can_prepare_params_during_compute(const std::vector<ggml_tensor*>& tensors) const { return false; }
     virtual void update_runtime_residency(uintptr_t owner_id,
                                           ggml_backend_t compute_backend,
                                           size_t resident_bytes) = 0;
