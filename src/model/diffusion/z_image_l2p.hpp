@@ -146,12 +146,12 @@ namespace ZImageL2P {
             const int64_t n_txt_pad = Rope::bound_mod(static_cast<int>(n_txt), ZImage::SEQ_MULTI_OF);
             if (n_txt_pad > 0) {
                 auto pad = params["cap_pad_token"];
-                txt      = ggml_concat(gctx, txt, ggml_repeat_4d(gctx, pad, pad->ne[0], n_txt_pad, N, 1), 1);
+                txt      = ggml_concat(gctx, txt, ZImage::repeat_pad_token(gctx, pad, n_txt_pad, N), 1);
             }
             const int64_t n_img_pad = Rope::bound_mod(static_cast<int>(n_img), ZImage::SEQ_MULTI_OF);
             if (n_img_pad > 0) {
                 auto pad = params["x_pad_token"];
-                img      = ggml_concat(gctx, img, ggml_repeat_4d(gctx, pad, pad->ne[0], n_img_pad, N, 1), 1);
+                img      = ggml_concat(gctx, img, ZImage::repeat_pad_token(gctx, pad, n_img_pad, N), 1);
             }
             GGML_ASSERT(txt->ne[1] + img->ne[1] == pe->ne[3]);
 

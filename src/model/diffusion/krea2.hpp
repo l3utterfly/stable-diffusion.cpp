@@ -345,7 +345,8 @@ namespace Krea2 {
             if (ctx->weight_adapter) {
                 lin = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, lin, prefix + "lin.weight");
             }
-            lin      = ggml_repeat(ctx->ggml_ctx, lin, vec);
+            // No ggml_repeat: ggml_add broadcasts, and Hexagon v81+ maps weights above 4 GiB
+            // (DMA64), where the HTP REPEAT kernel cannot read them.
             auto out = ggml_add(ctx->ggml_ctx, vec, lin);
             return ggml_ext_chunk(ctx->ggml_ctx, out, 6, 0);
         }

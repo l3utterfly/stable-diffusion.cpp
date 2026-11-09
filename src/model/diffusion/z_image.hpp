@@ -29,6 +29,12 @@ namespace ZImage {
     constexpr int SEQ_MULTI_OF        = 32;
     constexpr int CONTROL_IN_CHANNELS = 33;
 
+    // Hexagon v81 and newer map weights above 4 GiB (DMA64), where the HTP REPEAT kernel
+    // cannot read them. Copying the pad token first keeps the repeat on the NPU.
+    inline ggml_tensor* repeat_pad_token(ggml_context* ctx, ggml_tensor* pad_token, int64_t n_pad, int64_t N) {
+        return ggml_repeat_4d(ctx, ggml_cont(ctx, pad_token), pad_token->ne[0], n_pad, N, 1);
+    }
+
     struct ZImageConfig {
         int patch_size             = 2;
         int64_t hidden_size        = 3840;
@@ -734,7 +740,7 @@ namespace ZImage {
             int64_t n_pad_token = Rope::bound_mod(static_cast<int>(n_token), SEQ_MULTI_OF);
             if (n_pad_token > 0) {
                 auto img_pad_token   = params["x_pad_token"];
-                auto ctrl_pad_tokens = ggml_repeat_4d(ctx->ggml_ctx, img_pad_token, img_pad_token->ne[0], n_pad_token, N, 1);
+                auto ctrl_pad_tokens = repeat_pad_token(ctx->ggml_ctx, img_pad_token, n_pad_token, N);
                 c                    = ggml_concat(ctx->ggml_ctx, c, ctrl_pad_tokens, 1);
             }
 
@@ -825,13 +831,13 @@ namespace ZImage {
 
             int64_t n_txt_pad_token = Rope::bound_mod(static_cast<int>(n_txt_token), SEQ_MULTI_OF);
             if (n_txt_pad_token > 0) {
-                auto txt_pad_tokens = ggml_repeat_4d(ctx->ggml_ctx, txt_pad_token, txt_pad_token->ne[0], n_txt_pad_token, N, 1);
+                auto txt_pad_tokens = repeat_pad_token(ctx->ggml_ctx, txt_pad_token, n_txt_pad_token, N);
                 txt                 = ggml_concat(ctx->ggml_ctx, txt, txt_pad_tokens, 1);  // [N, n_txt_token + n_txt_pad_token, hidden_size]
             }
 
             int64_t n_img_pad_token = Rope::bound_mod(static_cast<int>(n_img_token), SEQ_MULTI_OF);
             if (n_img_pad_token > 0) {
-                auto img_pad_tokens = ggml_repeat_4d(ctx->ggml_ctx, img_pad_token, img_pad_token->ne[0], n_img_pad_token, N, 1);
+                auto img_pad_tokens = repeat_pad_token(ctx->ggml_ctx, img_pad_token, n_img_pad_token, N);
                 img                 = ggml_concat(ctx->ggml_ctx, img, img_pad_tokens, 1);  // [N, n_img_token + n_img_pad_token, hidden_size]
             }
 
