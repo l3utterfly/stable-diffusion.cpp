@@ -322,14 +322,23 @@ namespace Qwen {
             x                           = gated_residual(ctx, x, h, modulation[1], prefix_length);
             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
             h                           = modulate(ctx, h, modulation[2], prefix_length);
+            // Separate SiLU/MUL lets GGML reuse their input buffers on HTP.
+            const bool reuse_mlp_buffers = sd_backend_is(ctx->backend, "HTP");
             auto fused                  = blocks.find("img_mlp.gate_up");
             if (fused != blocks.end()) {
                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
-                h            = ggml_swiglu(ctx->ggml_ctx, gate_up);
+                if (reuse_mlp_buffers) {
+                    auto parts = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
+                    h = ggml_mul(ctx->ggml_ctx, parts[1], ggml_silu(ctx->ggml_ctx, parts[0]));
+                } else {
+                    h = ggml_swiglu(ctx->ggml_ctx, gate_up);
+                }
             } else {
                 auto gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
                 h         = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
-                h         = ggml_swiglu_split(ctx->ggml_ctx, gate, h);
+                h         = reuse_mlp_buffers
+                                ? ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate))
+                                : ggml_swiglu_split(ctx->ggml_ctx, gate, h);
             }
             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
             return gated_residual(ctx, x, h, modulation[3], prefix_length);
