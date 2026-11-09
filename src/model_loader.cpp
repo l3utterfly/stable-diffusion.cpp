@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cstdarg>
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <set>
@@ -33,6 +35,57 @@
 #include "zip.h"
 
 #include "name_conversion.h"
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+namespace {
+
+#if !defined(_WIN32)
+    // libc++'s ifstream reads through a small buffer (thousands of read calls per tensor). Segmented
+    // runs reload gigabytes of weights every step, so plain files use pread in large chunks instead.
+    class ChunkedFileReader {
+    public:
+        explicit ChunkedFileReader(const std::string& path) {
+            fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd_ >= 0) {
+                posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+            }
+        }
+        ~ChunkedFileReader() {
+            if (fd_ >= 0) {
+                ::close(fd_);
+            }
+        }
+        ChunkedFileReader(const ChunkedFileReader&)            = delete;
+        ChunkedFileReader& operator=(const ChunkedFileReader&) = delete;
+
+        bool is_open() const { return fd_ >= 0; }
+
+        bool read_at(char* buf, size_t n, uint64_t offset) const {
+            constexpr size_t chunk = static_cast<size_t>(16) << 20;
+            size_t done            = 0;
+            while (done < n) {
+                const ssize_t got = ::pread(fd_, buf + done, std::min(n - done, chunk), static_cast<off_t>(offset + done));
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (got <= 0) {
+                    return false;
+                }
+                done += static_cast<size_t>(got);
+            }
+            return true;
+        }
+
+    private:
+        int fd_ = -1;
+    };
+#endif
+
+}  // namespace
 
 /*================================================= Preprocess ==================================================*/
 
@@ -1179,6 +1232,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
                 std::ifstream file;
+#if !defined(_WIN32)
+                std::unique_ptr<ChunkedFileReader> chunked_file;
+#endif
                 zip_t* zip = nullptr;
                 if (is_zip) {
                     zip = zip_open(file_path.c_str(), 0, 'r');
@@ -1188,8 +1244,19 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         return;
                     }
                 } else if (!mmapped) {
-                    file.open(std::filesystem::u8path(file_path), std::ios::binary);
-                    if (!file.is_open()) {
+                    bool opened = false;
+#if !defined(_WIN32)
+                    chunked_file = std::make_unique<ChunkedFileReader>(file_path);
+                    opened       = chunked_file->is_open();
+                    if (!opened) {
+                        chunked_file.reset();
+                    }
+#endif
+                    if (!opened) {
+                        file.open(std::filesystem::u8path(file_path), std::ios::binary);
+                        opened = file.is_open();
+                    }
+                    if (!opened) {
                         LOG_ERROR("failed to open '%s'", file_path.c_str());
                         failed = true;
                         return;
@@ -1288,6 +1355,15 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                 return false;
                             }
                         } else {
+#if !defined(_WIN32)
+                            if (chunked_file != nullptr) {
+                                if (!chunked_file->read_at(buf, n, tensor_storage.offset)) {
+                                    LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
+                                    return false;
+                                }
+                                return true;
+                            }
+#endif
                             file.seekg(tensor_storage.offset);
                             file.read(buf, n);
                             if (!file) {
