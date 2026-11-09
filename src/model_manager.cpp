@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <thread>
@@ -539,9 +540,10 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
 
         const size_t alignment = ggml_backend_buft_get_alignment(staging_buft);
         size_t backend_limit   = ggml_backend_buft_get_max_size(staging_buft);
+        const size_t block_cap = residency_block_limit(staging_buft);
         if (!ggml_backend_buft_is_host(staging_buft) &&
-            (backend_limit == 0 || backend_limit > MAX_RESIDENCY_BLOCK_BYTES)) {
-            backend_limit = MAX_RESIDENCY_BLOCK_BYTES;
+            (backend_limit == 0 || backend_limit > block_cap)) {
+            backend_limit = block_cap;
         }
 
         const int64_t t0     = ggml_time_ms();
@@ -867,6 +869,15 @@ bool ModelManager::can_mmap_storage(const TensorState& state) const {
            backend_supports_host_buffer(state.compute_backend);
 }
 
+size_t ModelManager::residency_block_limit(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t device = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
+    const char* name          = device != nullptr ? ggml_backend_dev_name(device) : nullptr;
+    if (name != nullptr && std::strncmp(name, "HTP", 3) == 0) {
+        return MAX_HTP_RESIDENCY_BLOCK_BYTES;
+    }
+    return MAX_RESIDENCY_BLOCK_BYTES;
+}
+
 bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
                                         std::vector<ParamsStorageBlock*>& created_storage_blocks) {
     std::map<std::pair<ggml_backend_buffer_type_t, int>, std::vector<TensorState*>> states_by_buffer_type;
@@ -886,9 +897,10 @@ bool ModelManager::alloc_params_buffers(const std::vector<TensorState*>& states,
         const std::vector<TensorState*>& states = pair.second;
         size_t alignment                        = ggml_backend_buft_get_alignment(params_buft);
         size_t max_size                         = ggml_backend_buft_get_max_size(params_buft);
+        const size_t block_cap                  = residency_block_limit(params_buft);
         if (!ggml_backend_buft_is_host(params_buft) &&
-            (max_size == 0 || max_size > MAX_RESIDENCY_BLOCK_BYTES)) {
-            max_size = MAX_RESIDENCY_BLOCK_BYTES;
+            (max_size == 0 || max_size > block_cap)) {
+            max_size = block_cap;
         }
 
         auto alloc_chunk = [&](const std::vector<TensorState*>& chunk, size_t chunk_size) -> bool {
