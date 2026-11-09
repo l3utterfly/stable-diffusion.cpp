@@ -1,9 +1,11 @@
 #include "core/util.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <codecvt>
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -716,6 +718,35 @@ void sd_ggml_log_callback(ggml_log_level level, const char* text, void*) {
 void sd_set_log_callback(sd_log_cb_t cb, void* data) {
     sd_log_cb      = cb;
     sd_log_cb_data = data;
+}
+
+void sd_trace_stage(const char* model, const char* stage) {
+    const char* enabled = std::getenv("SD_TRACE");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+        return;
+    }
+    static std::atomic<uint64_t> sequence{0};
+    long long rss = -1, peak_rss = -1, available = -1, swap_free = -1;
+#if defined(__linux__)
+    char line[256];
+    if (FILE* file = std::fopen("/proc/self/status", "r")) {
+        while (std::fgets(line, sizeof(line), file)) {
+            std::sscanf(line, "VmRSS: %lld", &rss);
+            std::sscanf(line, "VmHWM: %lld", &peak_rss);
+        }
+        std::fclose(file);
+    }
+    if (FILE* file = std::fopen("/proc/meminfo", "r")) {
+        while (std::fgets(line, sizeof(line), file)) {
+            std::sscanf(line, "MemAvailable: %lld", &available);
+            std::sscanf(line, "SwapFree: %lld", &swap_free);
+        }
+        std::fclose(file);
+    }
+#endif
+    LOG_INFO("SD_TRACE seq=%llu us=%lld model=%s stage=%s rss_kib=%lld peak_rss_kib=%lld available_kib=%lld swap_free_kib=%lld",
+             static_cast<unsigned long long>(++sequence), static_cast<long long>(ggml_time_us()),
+             model, stage, rss, peak_rss, available, swap_free);
 }
 void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;

@@ -89,6 +89,7 @@ void pretty_bytes_progress(int step, int steps, uint64_t bytes_processed, float 
 
 void log_printf(sd_log_level_t level, const char* file, int line, const char* format, ...);
 void sd_ggml_log_callback(ggml_log_level level, const char* text, void*);
+void sd_trace_stage(const char* model, const char* stage);
 
 ggml_type sd_type_to_ggml_type(sd_type_t sdtype);
 bool validate_tensor_types(sd_type_t type, const char* tensor_type_rules);

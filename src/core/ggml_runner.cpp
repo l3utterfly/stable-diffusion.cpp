@@ -651,9 +651,11 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
     } graph_guard{*this, success};
 
     ggml_cgraph* graph = nullptr;
+    sd_trace_stage(get_desc().c_str(), "graph-build.begin");
     if (!prepare_compute_graph(get_graph, &graph)) {
         return std::nullopt;
     }
+    sd_trace_stage(get_desc().c_str(), "graph-build.end");
     params_tensor_set_dirty_ = true;
     rebuild_params_tensor_set();
     if (auto manager = residency_manager.lock()) {
@@ -779,6 +781,7 @@ bool GGMLRunner::fits(const std::vector<DeviceMemoryRequest>& requests,
 }
 
 bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads, const std::function<void()>& on_before_compute) {
+    sd_trace_stage(get_desc().c_str(), "scheduler-compute.begin");
     if (sd_backend_is_cpu(runtime_backend)) {
         sd_backend_cpu_set_n_threads(runtime_backend, n_threads);
     }
@@ -809,7 +812,9 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads, const std::f
     on_before_compute();
     const auto status = ggml_backend_sched_graph_compute_async(scheduler, graph);
 #endif
+    sd_trace_stage(get_desc().c_str(), "scheduler-compute.returned");
     workspace_.synchronize();
+    sd_trace_stage(get_desc().c_str(), "scheduler-synchronize.end");
     if (status != GGML_STATUS_SUCCESS) {
         last_compute_status_ = status;
         LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
@@ -870,7 +875,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
     bool segmented = can_segment && !fits(memory_requests({{runtime_backend, 0}}, 0), params);
     ComputeWorkspace::Measurement full_measurement;
     if (!segmented) {
+        sd_trace_stage(get_desc().c_str(), "workspace-measure.begin");
         full_measurement = measure(graph);
+        sd_trace_stage(get_desc().c_str(), "workspace-measure.end");
         if (full_measurement.buffers.empty()) {
             last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             return std::nullopt;
@@ -991,9 +998,11 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             }
             return ready;
         };
+        sd_trace_stage(get_desc().c_str(), "weights-prepare.begin");
         if (!weights.segment_start(index, ensure_capacity)) {
             return fail_segment("weight preparation");
         }
+        sd_trace_stage(get_desc().c_str(), "weights-prepare.end");
         // Preparing weights can execute LoRA graphs and reclaim an idle workspace.
         if (!workspace_.prepare(measurement)) {
             last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
@@ -1007,12 +1016,14 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             return fail_segment("output cache allocation");
         }
         new_cache_bytes = add_bytes(last ? 0 : cut_cache_.estimate_output_bytes(graph, segment), cache_.pending_bytes(segment_graph));
+        sd_trace_stage(get_desc().c_str(), "workspace-allocate.begin");
         if (!workspace_.allocate(segment_graph, [&](ggml_backend_sched_t scheduler, ggml_cgraph* current) {
                 pin_multi_device_nodes(scheduler, current);
             })) {
             last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             return fail_segment("workspace allocation");
         }
+        sd_trace_stage(get_desc().c_str(), "workspace-allocate.end");
         for (const auto& size : measurement.buffers) {
             track_compute_buffer(size.backend);
         }
@@ -1022,7 +1033,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         if (!ensure_capacity()) {
             return fail_segment("allocated capacity check");
         }
+        sd_trace_stage(get_desc().c_str(), "inputs-copy.begin");
         copy_data_to_backend_tensor(segment_graph, false);
+        sd_trace_stage(get_desc().c_str(), "inputs-copy.end");
         auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
         if (!prefetch_requests.empty()) {
             weights.enqueue_next(index, prefetch_requests.front());
