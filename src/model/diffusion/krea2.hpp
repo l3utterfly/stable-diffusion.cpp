@@ -227,7 +227,10 @@ namespace Krea2 {
 
             auto gate_x = gate->forward(ctx, x);
             auto up_x   = up->forward(ctx, x);
-            x           = ggml_swiglu_split(ctx->ggml_ctx, gate_x, up_x);
+            // Separate SiLU/MUL lets GGML reuse their input buffers on HTP.
+            x = sd_backend_is(ctx->backend, "HTP")
+                    ? ggml_mul(ctx->ggml_ctx, ggml_silu(ctx->ggml_ctx, gate_x), up_x)
+                    : ggml_swiglu_split(ctx->ggml_ctx, gate_x, up_x);
             return down->forward(ctx, x);
         }
     };
