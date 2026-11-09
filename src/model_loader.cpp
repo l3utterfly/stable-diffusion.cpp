@@ -1400,7 +1400,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                       bytes_processed.load(),
                                       elapsed_seconds);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
+            // The long tick only paces the progress bar. Without one it would set the
+            // floor of every streamed segment load (Nightmare Mobile dit/089).
+            std::this_thread::sleep_for(std::chrono::milliseconds(log_progress && total_tensors_to_process > 4 ? 200 : 1));
         }
 
         for (auto& w : workers) {
