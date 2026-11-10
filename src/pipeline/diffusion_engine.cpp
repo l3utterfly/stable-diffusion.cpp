@@ -2333,6 +2333,10 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                               const sd_cache_params_t* cache_params,
                                               bool preview_final_step,
                                               const sd::Tensor<float>& video_positions) {
+    struct SamplingScope {
+        SamplingScope() { sd_notify_sampling(true); }
+        ~SamplingScope() { sd_notify_sampling(false); }
+    } sampling_scope;
     struct RunnerEndOnExit {
         GGMLRunner* runner = nullptr;
         ~RunnerEndOnExit() {

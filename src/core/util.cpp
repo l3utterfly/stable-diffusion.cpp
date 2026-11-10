@@ -685,6 +685,10 @@ static void sd_log_dispatch(sd_log_level_t level, const std::string& origin, con
 }
 
 void log_printf(sd_log_level_t level, const char* file, int line, const char* format, ...) {
+    if (sd_log_cb == nullptr) return;
+#ifdef SD_QUIET_LOGS
+    if (level < SD_LOG_WARN) return;
+#endif
     va_list args;
     va_start(args, format);
     std::string message = sd_vformat(format, args);
@@ -694,6 +698,9 @@ void log_printf(sd_log_level_t level, const char* file, int line, const char* fo
 }
 
 void sd_ggml_log_callback(ggml_log_level level, const char* text, void*) {
+#ifdef SD_QUIET_LOGS
+    if (level != GGML_LOG_LEVEL_WARN && level != GGML_LOG_LEVEL_ERROR) return;
+#endif
     sd_log_level_t sd_level = SD_LOG_VERBOSE;
     switch (level) {
         case GGML_LOG_LEVEL_DEBUG:
@@ -720,6 +727,19 @@ void sd_set_log_callback(sd_log_cb_t cb, void* data) {
     sd_log_cb_data = data;
 }
 
+static void (*sd_sampling_cb)(bool, void*) = nullptr;
+static void* sd_sampling_cb_data = nullptr;
+
+void sd_set_sampling_callback(void (*callback)(bool, void*), void* data) {
+    sd_sampling_cb = callback;
+    sd_sampling_cb_data = data;
+}
+
+void sd_notify_sampling(bool active) {
+    if (sd_sampling_cb != nullptr) sd_sampling_cb(active, sd_sampling_cb_data);
+}
+
+#ifndef SD_QUIET_LOGS
 void sd_trace_stage(const char* model, const char* stage) {
     const char* enabled = std::getenv("SD_TRACE");
     if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
@@ -748,6 +768,7 @@ void sd_trace_stage(const char* model, const char* stage) {
              static_cast<unsigned long long>(++sequence), static_cast<long long>(ggml_time_us()),
              model, stage, rss, peak_rss, available, swap_free);
 }
+#endif
 void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;
     sd_progress_cb_data = data;
