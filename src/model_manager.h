@@ -33,9 +33,10 @@ public:
 
 private:
     static constexpr size_t MAX_RESIDENCY_BLOCK_BYTES = 1024ULL * 1024ULL * 1024ULL;
-    // Hexagon maps each weight buffer into the DSP's 32-bit address space below v81.
-    // Gigabyte mappings fragment a session's ~3 GB window, so keep production's blocks.
+    // Without DMA64, larger weight mappings fragment the DSP's ~3 GB address window.
+    // Experimental overrides remain capped at 64 MiB unless DMA64 is active.
     static constexpr size_t MAX_HTP_RESIDENCY_BLOCK_BYTES = 64ULL * 1024ULL * 1024ULL;
+    static constexpr size_t MAX_HTP_DMA64_RESIDENCY_BLOCK_BYTES = 256ULL * 1024ULL * 1024ULL;
     static size_t residency_block_limit(ggml_backend_buffer_type_t buft);
 
     struct TensorState {

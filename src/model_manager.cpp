@@ -1,8 +1,10 @@
 #include "model_manager.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -873,7 +875,31 @@ size_t ModelManager::residency_block_limit(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t device = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
     const char* name          = device != nullptr ? ggml_backend_dev_name(device) : nullptr;
     if (name != nullptr && std::strncmp(name, "HTP", 3) == 0) {
-        return MAX_HTP_RESIDENCY_BLOCK_BYTES;
+        auto reg = ggml_backend_dev_backend_reg(device);
+        using IsDma64Enabled = bool (*)(void);
+        auto is_dma64_enabled = reg != nullptr
+                                    ? reinterpret_cast<IsDma64Enabled>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_is_dma64_enabled"))
+                                    : nullptr;
+        const bool dma64_enabled = is_dma64_enabled != nullptr && is_dma64_enabled();
+        static const size_t htp_block_override = []() -> size_t {
+            const char* override_mib = std::getenv("SD_HTP_RESIDENCY_BLOCK_MIB");
+            if (override_mib == nullptr || override_mib[0] == '\0') {
+                return 0;
+            }
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long mib = std::strtoul(override_mib, &end, 10);
+            GGML_ASSERT(errno == 0 && end != override_mib && *end == '\0' && mib >= 1 && mib <= 1024);
+            return static_cast<size_t>(mib) * 1024ULL * 1024ULL;
+        }();
+        size_t block_limit = htp_block_override != 0 ? htp_block_override
+                                                    : (dma64_enabled ? MAX_HTP_DMA64_RESIDENCY_BLOCK_BYTES : MAX_HTP_RESIDENCY_BLOCK_BYTES);
+        if (!dma64_enabled && block_limit > MAX_HTP_RESIDENCY_BLOCK_BYTES) {
+            LOG_WARN("Clamping HTP residency block override to 64 MiB because DMA64 is inactive");
+            block_limit = MAX_HTP_RESIDENCY_BLOCK_BYTES;
+        }
+        LOG_INFO("HTP residency block limit: %zu MiB (DMA64 %s)", block_limit / (1024 * 1024), dma64_enabled ? "enabled" : "disabled");
+        return block_limit;
     }
     return MAX_RESIDENCY_BLOCK_BYTES;
 }
