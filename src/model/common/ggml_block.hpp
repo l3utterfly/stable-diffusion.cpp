@@ -599,6 +599,10 @@ public:
         scale = scale_value;
     }
 
+    float get_scale() const {
+        return scale;
+    }
+
     std::string get_desc() override {
         return "Conv2d";
     }

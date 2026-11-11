@@ -503,7 +503,9 @@ public:
                 std::string name = "up." + std::to_string(i) + ".upsample";
                 auto up_sample   = std::dynamic_pointer_cast<UpSampleBlock>(blocks[name]);
 
-                if (!f16_activations && h->type == GGML_TYPE_F32) {
+                // Scaled VAEs need FP32 activation range after inverse scaling,
+                // even when the backend supports fused FP16 upsampling.
+                if (!f16_activations && h->type == GGML_TYPE_F32 && conv_in->get_scale() == 1.f) {
                     ggml_tensor* h_f16 = ggml_cast(ctx->ggml_ctx, h, GGML_TYPE_F16);
                     if (up_sample->supports_upscale(ctx, h_f16)) {
                         h = h_f16;
