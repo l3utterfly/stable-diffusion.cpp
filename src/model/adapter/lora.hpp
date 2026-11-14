@@ -1124,6 +1124,20 @@ public:
         return patch_weight(ctx, backend, weight, weight_name, true);
     }
 
+    // A matmul whose weight type the backend cannot run (e.g. MXFP4 on HTP) is
+    // scheduled on CPU. Adding inplace onto it would keep that CPU allocation
+    // as the destination of an ADD the scheduler places on the accelerator.
+    static ggml_tensor* add_to_output(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* out, ggml_tensor* addend) {
+        const ggml_tensor* producer = out;
+        while (producer->view_src != nullptr) {
+            producer = producer->view_src;
+        }
+        if (backend == nullptr || ggml_backend_supports_op(backend, producer)) {
+            return ggml_add_inplace(ctx, out, addend);
+        }
+        return ggml_add(ctx, out, addend);
+    }
+
     ggml_tensor* forward_with_lora(ggml_context* ctx,
                                    ggml_backend_t backend,
                                    ggml_tensor* x,
@@ -1137,7 +1151,10 @@ public:
         }
         ggml_tensor* out;
         if (forward_params.op_type == ForwardParams::op_type_t::OP_LINEAR) {
-            out = ggml_ext_linear(ctx, x, w, b, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+            out = ggml_ext_linear(ctx, x, w, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+            if (b) {
+                out = add_to_output(ctx, backend, out, b);
+            }
         } else {  // OP_CONV2D
             out = ggml_ext_conv_2d(ctx,
                                    x,
@@ -1159,7 +1176,7 @@ public:
             if (out_diff == nullptr) {
                 continue;
             }
-            out = ggml_add_inplace(ctx, out, out_diff);
+            out = add_to_output(ctx, backend, out, out_diff);
         }
         return out;
     }
@@ -1181,12 +1198,12 @@ public:
                                                         nullptr,
                                                         forward_params.linear.force_prec_f32,
                                                         forward_params.linear.scale);
-                output                = ggml_add_inplace(ctx, output, out_diff);
+                output                = add_to_output(ctx, backend, output, out_diff);
             }
 
             ggml_tensor* out_diff = lora_model->get_out_diff(ctx, backend, x, w, forward_params, prefix + "weight");
             if (out_diff != nullptr) {
-                output = ggml_add_inplace(ctx, output, out_diff);
+                output = add_to_output(ctx, backend, output, out_diff);
             }
         }
         return output;
