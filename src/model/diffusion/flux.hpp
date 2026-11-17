@@ -372,6 +372,19 @@ namespace Flux {
         }
     };
 
+    static ggml_tensor* silu_act(GGMLRunnerContext* ctx, ggml_tensor* x, bool gate_first = true) {
+        if (sd_backend_is(ctx->backend, "HTP")) {
+            // GLU cannot reuse its input allocation. Copy the gate/up views
+            // out of the fused QKV projection so activation no longer needs
+            // its large backing buffer mapped alongside the output buffers.
+            // SiLU/MUL can then reuse the smaller contiguous allocations.
+            auto parts = ggml_ext_chunk(ctx->ggml_ctx, x, 2, 0);
+            auto gate  = ggml_silu(ctx->ggml_ctx, parts[gate_first ? 0 : 1]);
+            return ggml_mul(ctx->ggml_ctx, parts[gate_first ? 1 : 0], gate);
+        }
+        return ggml_ext_silu_act(ctx->ggml_ctx, x, gate_first);
+    }
+
     struct MLP : public UnaryBlock {
         bool use_mlp_silu_act;
 
@@ -389,7 +402,7 @@ namespace Flux {
 
             x = mlp_0->forward(ctx, x);
             if (use_mlp_silu_act) {
-                x = ggml_ext_silu_act(ctx->ggml_ctx, x);
+                x = silu_act(ctx, x);
             } else {
                 x = ggml_ext_gelu(ctx->ggml_ctx, x, true);
             }
@@ -837,9 +850,9 @@ namespace Flux {
 
             auto mlp = ggml_view_3d(ctx->ggml_ctx, qkv_mlp, mlp_hidden_dim * mlp_mult_factor, qkv_mlp->ne[1], qkv_mlp->ne[2], qkv_mlp->nb[1], qkv_mlp->nb[2], hidden_size * 3 * qkv_mlp->nb[0]);
             if (use_yak_mlp) {
-                mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp, false);
+                mlp = silu_act(ctx, mlp, false);
             } else if (use_mlp_silu_act) {
-                mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp);
+                mlp = silu_act(ctx, mlp);
             } else {
                 mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
             }
