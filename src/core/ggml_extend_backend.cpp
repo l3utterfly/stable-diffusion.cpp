@@ -124,6 +124,50 @@ static std::string backend_cache_key(ggml_backend_t backend) {
     return backend_name != nullptr ? lower_copy(backend_name) : "";
 }
 
+static const char* backend_device_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+            return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+            return "discrete GPU";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return "integrated GPU";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            return "accelerator";
+        default:
+            return "other";
+    }
+}
+
+// "CUDA0: NVIDIA GeForce RTX ... (discrete GPU, 3071/24463 MiB free)"
+static std::string describe_backend_device(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        const char* name = ggml_backend_name(backend);
+        return name != nullptr ? name : "unknown";
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+    char text[512];
+    snprintf(text,
+             sizeof(text),
+             "%s: %s (%s, %zu/%zu MiB free)",
+             ggml_backend_dev_name(dev),
+             ggml_backend_dev_description(dev),
+             backend_device_type_name(ggml_backend_dev_type(dev)),
+             free_bytes >> 20,
+             total_bytes >> 20);
+    return text;
+}
+
+// At INFO, because on hybrid-GPU machines the default device is otherwise visible only in
+// verbose logs.
+static void log_initialized_backend(ggml_backend_t backend, const std::string& requested) {
+    const std::string reason = is_default_backend_token(requested) ? "default device"
+                                                                   : "requested \"" + trim_copy(requested) + "\"";
+    LOG_INFO("using backend device %s [%s]", describe_backend_device(backend).c_str(), reason.c_str());
+}
+
 static std::string resolve_first_device_by_type(enum ggml_backend_dev_type type) {
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(type);
     if (dev == nullptr) {
@@ -994,6 +1038,19 @@ bool SDBackendManager::runtime_backend_supports_host_buffer(SDBackendModule modu
     return props.caps.buffer_from_host_ptr;
 }
 
+void SDBackendManager::log_devices() const {
+    std::vector<std::string> devices;
+    for (const auto& entry : backends_) {
+        devices.push_back(describe_backend_device(entry.second.get()));
+    }
+    std::sort(devices.begin(), devices.end());
+    std::string joined;
+    for (const auto& device : devices) {
+        joined += (joined.empty() ? "" : "; ") + device;
+    }
+    LOG_INFO("backend devices: %s", joined.empty() ? "none initialized" : joined.c_str());
+}
+
 bool SDBackendManager::init(const char* backend_spec,
                             const char* params_backend_spec,
                             const char* split_mode_spec,
@@ -1175,6 +1232,7 @@ ggml_backend_t SDBackendManager::init_cached_backend(const std::string& name) {
     SDBackendHandle handle(backend);
     sd_ggml_register_extensions(backend);
     backends_.emplace(actual_key, std::move(handle));
+    log_initialized_backend(backend, name);
     return backend;
 }
 

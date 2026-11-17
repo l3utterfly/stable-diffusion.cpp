@@ -79,6 +79,8 @@ public:
     bool params_backend_is_disk(SDBackendModule module) const;
     bool params_backend_follows_runtime(SDBackendModule module) const;
     bool runtime_backend_supports_host_buffer(SDBackendModule module);
+    // Logs every device this manager has initialized, with its live free memory.
+    void log_devices() const;
 
 private:
     bool validate(std::string* error) const;

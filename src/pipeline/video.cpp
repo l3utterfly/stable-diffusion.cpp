@@ -1736,6 +1736,7 @@ namespace sd::pipeline {
                      request.height,
                      request.frames);
         }
+        sd->backend_manager.log_devices();
 
         int64_t latent_start = ggml_time_ms();
         int W                = request.width / request.vae_scale_factor;

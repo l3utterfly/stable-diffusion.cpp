@@ -867,6 +867,7 @@ namespace sd::pipeline {
         sd_img_gen_params = &processed_params;
         request.pm_params = processed_params.pm_params;
         LOG_INFO("generate_image %dx%d", request.width, request.height);
+        sd->backend_manager.log_devices();
 
         sd->rng->manual_seed(request.seed);
         sd->sampler_rng->manual_seed(request.seed);
