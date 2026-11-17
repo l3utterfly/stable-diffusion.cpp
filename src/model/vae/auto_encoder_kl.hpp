@@ -380,7 +380,7 @@ public:
 
         // end
         h = norm_out->forward(ctx, h);
-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
+        h = ggml_ext_silu_inplace(ctx->ggml_ctx, h, ctx->backend);  // nonlinearity/swish
         h = conv_out->forward(ctx, h);            // [N, z_channels*2, h, w]
         return h;
     }

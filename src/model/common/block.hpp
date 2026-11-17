@@ -144,7 +144,7 @@ public:
 
         // in_layers
         auto h = in_layers_0->forward(ctx, x);
-        h      = ggml_silu_inplace(ctx->ggml_ctx, h);
+        h      = ggml_ext_silu_inplace(ctx->ggml_ctx, h, ctx->backend);
         h      = in_layers_2->forward(ctx, h);  // [N, out_channels, h, w] if dims == 2 else [N, out_channels, t, h, w]
 
         // emb_layers
@@ -169,7 +169,7 @@ public:
 
         // out_layers
         h = out_layers_0->forward(ctx, h);
-        h = ggml_silu_inplace(ctx->ggml_ctx, h);
+        h = ggml_ext_silu_inplace(ctx->ggml_ctx, h, ctx->backend);
         // dropout, skip for inference
         h = out_layers_3->forward(ctx, h);
 

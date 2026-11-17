@@ -887,19 +887,47 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
                                  ggml_tensor* b,
                                  int num_groups,
                                  float eps,
-                                 bool inplace) {
+                                 bool inplace,
+                                 ggml_backend_t backend) {
     if (ggml_n_dims(x) >= 3 && w != nullptr && b != nullptr) {
         w = ggml_reshape_4d(ctx, w, 1, 1, w->ne[0], 1);
         b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
     }
 
-    x = inplace ? ggml_group_norm_inplace(ctx, x, num_groups, eps)
-                : ggml_group_norm(ctx, x, num_groups, eps);
+    ggml_tensor* input = x;
+    x = inplace ? ggml_group_norm_inplace(ctx, input, num_groups, eps)
+                : ggml_group_norm(ctx, input, num_groups, eps);
+    // A backend can reject the normalization for one shape only (HTP F32 needs
+    // a plane size divisible by 32). It then runs on CPU, and an in-place
+    // affine op scheduled on the backend would write into that CPU buffer.
+    const bool fallback = backend != nullptr && !ggml_backend_supports_op(backend, x);
+    if (fallback && inplace) {
+        x = ggml_group_norm(ctx, input, num_groups, eps);
+    }
     if (w != nullptr && b != nullptr) {
-        x = ggml_mul_inplace(ctx, x, w);
-        x = ggml_add_inplace(ctx, x, b);
+        if (fallback) {
+            x = ggml_mul(ctx, x, w);
+            x = ggml_backend_supports_op(backend, x) ? ggml_add_inplace(ctx, x, b)
+                                                     : ggml_add(ctx, x, b);
+        } else {
+            x = ggml_mul_inplace(ctx, x, w);
+            x = ggml_add_inplace(ctx, x, b);
+        }
     }
     return x;
+}
+
+ggml_tensor* ggml_ext_silu_inplace(ggml_context* ctx,
+                                   ggml_tensor* x,
+                                   ggml_backend_t backend) {
+    const ggml_tensor* producer = x;
+    while (producer->view_src != nullptr) {
+        producer = producer->view_src;
+    }
+    // Leaves (inputs, weights) have no producing operation to query.
+    const bool supported = backend == nullptr || producer->op == GGML_OP_NONE ||
+                           ggml_backend_supports_op(backend, producer);
+    return supported ? ggml_silu_inplace(ctx, x) : ggml_silu(ctx, x);
 }
 
 ggml_tensor* ggml_ext_timestep_embedding(

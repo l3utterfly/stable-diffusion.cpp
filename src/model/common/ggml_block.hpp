@@ -1152,7 +1152,7 @@ public:
         ggml_tensor* w = nullptr;
         ggml_tensor* b = nullptr;
         get_affine_params(ctx, &w, &b);
-        return ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups, eps, inplace);
+        return ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups, eps, inplace, ctx->backend);
     }
 
     ggml_tensor* forward_silu(GGMLRunnerContext* ctx, ggml_tensor* x,
@@ -1171,8 +1171,8 @@ public:
             }
         }
 
-        x = ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups, eps, inplace);
-        return ggml_silu_inplace(ctx->ggml_ctx, x);
+        x = ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups, eps, inplace, ctx->backend);
+        return ggml_ext_silu_inplace(ctx->ggml_ctx, x, ctx->backend);
     }
 };
 

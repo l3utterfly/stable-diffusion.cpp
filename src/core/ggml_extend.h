@@ -250,7 +250,14 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
                                  ggml_tensor* b,
                                  int num_groups = 32,
                                  float eps      = 1e-6f,
-                                 bool inplace   = false);
+                                 bool inplace   = false,
+                                 ggml_backend_t backend = nullptr);
+
+// SiLU in place, unless the operation that owns x's storage falls back to CPU
+// on this backend; an in-place op must not write into another backend's buffer.
+ggml_tensor* ggml_ext_silu_inplace(ggml_context* ctx,
+                                   ggml_tensor* x,
+                                   ggml_backend_t backend);
 
 ggml_tensor* ggml_ext_timestep_embedding(
     ggml_context* ctx,
