@@ -144,6 +144,10 @@ namespace ZImage {
 #endif
         if (proj.has_quantized_weight()) {
             proj.set_scale(1.f / 16.f);
+        } else if (proj.weight_type() == GGML_TYPE_F16 && sd_backend_is(backend, "CUDA")) {
+            // cuBLAS computes F16 weights in F16. Quantized fine-tunes that keep their refiner
+            // blocks in F16 (e.g. IntoRealism Q4_0) overflow there and render a blank image.
+            proj.set_force_prec_f32(true);
         }
     }
 
